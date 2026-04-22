@@ -1,0 +1,23 @@
+[package]
+name = "magicwand"
+version = "0.1.0"
+edition = "2021"
+description = "Draw a gesture to spawn a floating window in that zone"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+
+tiny-skia = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
