@@ -186,7 +186,7 @@ impl PickerState {
             self.matches = scored;
         } else {
             let pattern =
-                Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+                Pattern::parse(&self.query, CaseMatching::Ignore, Normalization::Smart);
             let mut buf = Vec::new();
             let mut scored: Vec<ScoredMatch> = self
                 .apps

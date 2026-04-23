@@ -18,6 +18,11 @@ default_term = "kitty"
 #                 are rounded DOWN to the nearest multiple of cell size so
 #                 terminal windows land on integer column/row boundaries.
 #                 A drawn rectangle becomes a clean N×M cell grid.
+#
+# NOTE: these rules only apply when the user actually drew a bbox. A bare
+# click (no drag) tells spawnhere "open this app at its natural size", and
+# the per-app min_width / min_height are intentionally *not* enforced in
+# that case — otherwise clicks would always expand into the rule footprint.
 
 [rules.kitty]
 min_width = 480

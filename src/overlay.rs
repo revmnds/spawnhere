@@ -56,8 +56,6 @@ pub enum Outcome {
 pub struct RunConfig {
     pub preset_exec: Option<String>,
     pub padding: u32,
-    pub min_width: u32,
-    pub min_height: u32,
     pub history: History,
 }
 
@@ -152,7 +150,7 @@ struct AppState {
 }
 
 pub fn run(cfg: RunConfig) -> Result<Outcome> {
-    let RunConfig { preset_exec, padding, min_width, min_height, history } = cfg;
+    let RunConfig { preset_exec, padding, history } = cfg;
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initializing Wayland registry")?;
@@ -294,14 +292,14 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
     let stroke = std::mem::take(&mut state.stroke);
     Ok(match std::mem::replace(&mut state.decision, Decision::Cancel) {
         Decision::Spawn(exec) => {
+            // Respect whatever the user drew — 0×0 (bare click), a 5 px line,
+            // or a big rectangle. The downstream spawn honors the bbox as-is
+            // (or omits `size` entirely when it's 0×0 so the app uses its
+            // natural default). clamp_to_rect just keeps the spawn point
+            // inside the monitor's safe area.
             let raw = stroke.bbox(padding);
-            if raw.w == 0 && raw.h == 0 {
-                // Click without drag — treat as cancel rather than spawn at 0×0.
-                Outcome::Cancelled
-            } else {
-                let bbox = raw.enforce_min(min_width, min_height).clamp_to_rect(screen);
-                Outcome::Spawn { bbox, exec, screen }
-            }
+            let bbox = raw.clamp_to_rect(screen);
+            Outcome::Spawn { bbox, exec, screen }
         }
         _ => Outcome::Cancelled,
     })

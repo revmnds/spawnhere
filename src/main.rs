@@ -26,14 +26,6 @@ struct Cli {
     #[arg(long, short = 't')]
     term: bool,
 
-    /// Minimum width in pixels if stroke bbox is smaller.
-    #[arg(long, default_value_t = 400)]
-    min_width: u32,
-
-    /// Minimum height in pixels if stroke bbox is smaller.
-    #[arg(long, default_value_t = 300)]
-    min_height: u32,
-
     /// Extra pixels added to the bbox on each side (0 = exact stroke fidelity).
     #[arg(long, default_value_t = 0)]
     padding: u32,
@@ -62,8 +54,6 @@ fn main() -> Result<()> {
     let outcome = overlay::run(overlay::RunConfig {
         preset_exec,
         padding: cli.padding,
-        min_width: cli.min_width,
-        min_height: cli.min_height,
         history: History::load(),
     })
     .context("overlay failed")?;
@@ -73,9 +63,22 @@ fn main() -> Result<()> {
         overlay::Outcome::Cancelled => return Ok(()),
     };
 
-    // Re-clamp after per-app rule expansions: `rules.X.min_width` can grow
-    // the box back over an edge. `screen` is the overlay's rect.
-    let bbox = config::apply_rule(bbox, cfg.rule_for(&exec)).clamp_to_rect(screen);
+    // Clamp to the safe area (monitor minus any layer-shells anchored to its
+    // edges — quickshell/waybar/eww panels). Without this, expansions could
+    // push the bbox into the bar's visual zone, since Hyprland's plain
+    // `move X Y` is reserved-area-unaware. Falls back to the overlay's full
+    // rect if hyprctl is unreachable.
+    //
+    // Per-app TOML rules (min_width / cell_px) only apply when the user
+    // actually drew a rectangle. A bare click means "spawn here at the app's
+    // natural size" — we don't override that with a rule, since that would
+    // make every click expand into the rule's footprint.
+    let safe = hyprland::focused_monitor_safe_area().unwrap_or(screen);
+    let bbox = if bbox.w > 0 && bbox.h > 0 {
+        config::apply_rule(bbox, cfg.rule_for(&exec)).clamp_to_rect(safe)
+    } else {
+        bbox.clamp_to_rect(safe)
+    };
     hyprland::spawn_floating(&exec, bbox)?;
     History::record(&exec);
     Ok(())
