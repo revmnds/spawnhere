@@ -1,7 +1,13 @@
 use cosmic_text::{
-    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache,
+    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
 };
 use tiny_skia::Pixmap;
+
+/// Inter Variable (OFL 1.1) embedded into the binary so the UI looks identical
+/// on any machine, independent of what `sans-serif` resolves to on that
+/// system. One variable file covers all weights the picker uses.
+const INTER_VARIABLE_TTF: &[u8] =
+    include_bytes!("../../assets/fonts/Inter-Variable.ttf");
 
 pub struct TextRenderer {
     font_system: FontSystem,
@@ -10,22 +16,31 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new() -> Self {
+        let mut font_system = FontSystem::new();
+        font_system.db_mut().load_font_data(INTER_VARIABLE_TTF.to_vec());
         Self {
-            font_system: FontSystem::new(),
+            font_system,
             swash_cache: SwashCache::new(),
         }
     }
 
+    fn attrs(weight: Weight) -> Attrs<'static> {
+        Attrs::new().family(Family::Name("Inter")).weight(weight)
+    }
+
     /// Returns the laid-out width of `text` at `size`, in pixels.
     pub fn measure_width(&mut self, text: &str, size: f32) -> f32 {
+        self.measure_width_weighted(text, size, Weight::NORMAL)
+    }
+
+    pub fn measure_width_weighted(&mut self, text: &str, size: f32, weight: Weight) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
         let metrics = Metrics::new(size, size * 1.4);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
-        let attrs = Attrs::new().family(Family::SansSerif);
-        buffer.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, Self::attrs(weight), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
         buffer
             .layout_runs()
@@ -46,11 +61,25 @@ impl TextRenderer {
         max_width: f32,
         color: (u8, u8, u8, u8),
     ) {
+        self.draw_weighted(pixmap, x, y, text, size, max_width, color, Weight::NORMAL);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_weighted(
+        &mut self,
+        pixmap: &mut Pixmap,
+        x: i32,
+        y: i32,
+        text: &str,
+        size: f32,
+        max_width: f32,
+        color: (u8, u8, u8, u8),
+        weight: Weight,
+    ) {
         let metrics = Metrics::new(size, size * 1.4);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(max_width), Some(size * 1.6));
-        let attrs = Attrs::new().family(Family::SansSerif);
-        buffer.set_text(&mut self.font_system, text, attrs, Shaping::Advanced);
+        buffer.set_text(&mut self.font_system, text, Self::attrs(weight), Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         let ct_color = CtColor::rgba(color.0, color.1, color.2, color.3);
@@ -74,9 +103,6 @@ impl TextRenderer {
                         }
                         let idx = (py as usize) * stride + (px as usize);
                         let dst = &mut pixels[idx];
-                        // Source is premultiplied RGBA from cosmic-text/swash.
-                        // Destination is non-premultiplied RGBA in tiny-skia Pixmap.
-                        // For simplicity: alpha-blend assuming src is straight alpha.
                         let src_a = gcolor.a() as u32;
                         if src_a == 0 {
                             continue;
@@ -91,7 +117,6 @@ impl TextRenderer {
                             .unwrap();
                             continue;
                         }
-                        // src over dst (straight alpha)
                         let inv = 255 - src_a;
                         let dst_rgba = dst.demultiply();
                         let r = ((gcolor.r() as u32 * src_a + dst_rgba.red() as u32 * inv) / 255) as u8;
