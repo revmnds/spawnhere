@@ -14,7 +14,7 @@ mod stroke;
 use history::History;
 
 #[derive(Parser)]
-#[command(name = "magicwand", version, about = "Draw a gesture to spawn a floating window")]
+#[command(name = "spawnhere", version, about = "Draw a gesture to spawn a floating window")]
 struct Cli {
     /// Command to spawn directly at the drawn bbox (skips the picker).
     /// If omitted, an app picker appears after the gesture.
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
     hyprland::ensure_running().context("Hyprland not detected")?;
 
-    // Single-instance: another magicwand already running? Exit quietly so the
+    // Single-instance: another spawnhere already running? Exit quietly so the
     // same keybind can be spammed without stacking overlays.
     let _lock = match acquire_single_instance_lock()? {
         Some(f) => f,
@@ -85,7 +85,7 @@ fn lock_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .expect("XDG_RUNTIME_DIR is set under systemd-logind (required by Hyprland)");
-    dir.join("magicwand.lock")
+    dir.join("spawnhere.lock")
 }
 
 /// Returns `Some(File)` if we acquired the single-instance lock (caller must

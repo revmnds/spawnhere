@@ -1,9 +1,9 @@
-# ~/.config/magicwand/config.toml
+# ~/.config/spawnhere/config.toml
 #
-# All fields are optional — magicwand runs fine with no file at all. Copy this
-# to `~/.config/magicwand/config.toml` and edit to taste.
+# All fields are optional — spawnhere runs fine with no file at all. Copy this
+# to `~/.config/spawnhere/config.toml` and edit to taste.
 
-# Terminal used when invoking `magicwand --term` (or `-t`). Falls back to the
+# Terminal used when invoking `spawnhere --term` (or `-t`). Falls back to the
 # `$TERMINAL` environment variable, then `kitty`.
 default_term = "kitty"
 

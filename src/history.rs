@@ -1,5 +1,5 @@
 //! MRU history: each spawn appends the chosen exec to
-//! `~/.local/share/magicwand/history`. On load, counts and recency boost
+//! `~/.local/share/spawnhere/history`. On load, counts and recency boost
 //! nucleo-matcher scores in the picker so yesterday's kitty sits on top.
 
 use std::collections::HashMap;
@@ -87,7 +87,7 @@ fn history_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("magicwand").join("history"))
+    Some(base.join("spawnhere").join("history"))
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-# magicwand
+# spawnhere
 
 Draw a gesture on your Hyprland desktop → spawn a floating window exactly where you drew.
 
@@ -19,25 +19,25 @@ Or skip step 3 with `--term`: gesture → terminal at that bbox, no picker.
 - **Session**: Wayland.
 - **Runtime**: systemd-logind (for `$XDG_RUNTIME_DIR`).
 
-magicwand is intentionally Hyprland-only. It relies on `hyprctl dispatch exec` for the atomic "spawn floating at (x, y, w, h)" action that Sway / river / Wayfire don't expose in one shot. GNOME / KDE additionally don't advertise `zwlr_layer_shell_v1`, so the overlay can't even draw there.
+spawnhere is intentionally Hyprland-only. It relies on `hyprctl dispatch exec` for the atomic "spawn floating at (x, y, w, h)" action that Sway / river / Wayfire don't expose in one shot. GNOME / KDE additionally don't advertise `zwlr_layer_shell_v1`, so the overlay can't even draw there.
 
 ## Install
 
 ### From source
 
 ```bash
-git clone https://github.com/yourname/magicwand
-cd magicwand
+git clone https://github.com/yourname/spawnhere
+cd spawnhere
 cargo build --release
-install -Dm755 target/release/magicwand ~/.local/bin/magicwand
+install -Dm755 target/release/spawnhere ~/.local/bin/spawnhere
 ```
 
 ### AUR (Arch Linux)
 
 ```bash
-yay -S magicwand
+yay -S spawnhere
 # or, for the git tip
-yay -S magicwand-git
+yay -S spawnhere-git
 ```
 
 (PKGBUILD lives in `packaging/aur/`.)
@@ -48,13 +48,13 @@ Add to `~/.config/hypr/hyprland.conf` (or `~/.config/hypr/custom/keybinds.conf`)
 
 ```conf
 # Draw → pick app → spawn floating
-bind = SUPER, grave, exec, magicwand
+bind = SUPER, grave, exec, spawnhere
 
 # Draw → spawn terminal (skips the picker)
-bind = SUPER SHIFT, grave, exec, magicwand --term
+bind = SUPER SHIFT, grave, exec, spawnhere --term
 
 # Draw → spawn a specific command
-bind = SUPER ALT, grave, exec, magicwand --spawn "firefox"
+bind = SUPER ALT, grave, exec, spawnhere --spawn "firefox"
 ```
 
 Then `hyprctl reload`.
@@ -62,7 +62,7 @@ Then `hyprctl reload`.
 ## CLI
 
 ```
-magicwand [OPTIONS]
+spawnhere [OPTIONS]
 
   -s, --spawn <CMD>        Command to spawn directly at the drawn bbox (skips picker)
   -t, --term               Shortcut for `--spawn $TERMINAL`
@@ -75,7 +75,7 @@ magicwand [OPTIONS]
 
 ## Config
 
-Optional `~/.config/magicwand/config.toml`:
+Optional `~/.config/spawnhere/config.toml`:
 
 ```toml
 default_term = "kitty"         # fallback for --term if $TERMINAL unset
@@ -102,11 +102,11 @@ Rule matching uses the first path component of the chosen exec: `/usr/bin/kitty 
 
 ## MRU
 
-Every spawn appends the exec to `~/.local/share/magicwand/history`. When the query is empty, the picker sorts recent picks to the top under a "Recent" section header, then everything else below under "Other apps". Delete the file to reset.
+Every spawn appends the exec to `~/.local/share/spawnhere/history`. When the query is empty, the picker sorts recent picks to the top under a "Recent" section header, then everything else below under "Other apps". Delete the file to reset.
 
 ## Multi-monitor
 
-The overlay appears on whichever monitor Hyprland decides is "active" when the bind fires (typically the one with focus). Drawing happens on that monitor; the spawned window lands on the same one. To use magicwand on another monitor, focus it first (hover or keyboard-switch) and then press the bind.
+The overlay appears on whichever monitor Hyprland decides is "active" when the bind fires (typically the one with focus). Drawing happens on that monitor; the spawned window lands on the same one. To use spawnhere on another monitor, focus it first (hover or keyboard-switch) and then press the bind.
 
 ## HiDPI
 

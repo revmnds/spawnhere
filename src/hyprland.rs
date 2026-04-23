@@ -10,7 +10,7 @@ pub fn ensure_running() -> Result<()> {
         bail!(
             "Hyprland not detected.\n\
              \n\
-             magicwand needs a running Hyprland session — HYPRLAND_INSTANCE_SIGNATURE is unset.\n\
+             spawnhere needs a running Hyprland session — HYPRLAND_INSTANCE_SIGNATURE is unset.\n\
              Check your session:  echo $XDG_CURRENT_DESKTOP   (should contain \"Hyprland\")\n\
              \n\
              GNOME, KDE, Sway, and other compositors are not supported."

@@ -1,5 +1,5 @@
-//! Optional `~/.config/magicwand/config.toml`. All fields are optional —
-//! magicwand runs fine with no file. The config drives:
+//! Optional `~/.config/spawnhere/config.toml`. All fields are optional —
+//! spawnhere runs fine with no file. The config drives:
 //!
 //! * `default_term` — which exec to spawn in `--term` mode if `$TERMINAL` is
 //!   unset. Falls back to `"kitty"` if neither is set.
@@ -41,7 +41,7 @@ impl Config {
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("magicwand: {} — ignoring: {e}", path.display());
+                eprintln!("spawnhere: {} — ignoring: {e}", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -88,7 +88,7 @@ fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("magicwand").join("config.toml"))
+    Some(base.join("spawnhere").join("config.toml"))
 }
 
 #[cfg(test)]

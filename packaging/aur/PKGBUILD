@@ -1,10 +1,10 @@
 # Maintainer: mapache <mastersuv@gmail.com>
-pkgname=magicwand
+pkgname=spawnhere
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Draw a gesture on Hyprland, spawn a floating window exactly where you drew"
 arch=('x86_64')
-url="https://github.com/yourname/magicwand"
+url="https://github.com/yourname/spawnhere"
 license=('MIT')
 depends=(
   'hyprland'

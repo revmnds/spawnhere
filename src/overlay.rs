@@ -162,7 +162,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
     let layer_shell = LayerShell::bind(&globals, &qh).context(
         "zwlr_layer_shell_v1 not advertised by the Wayland compositor. \
-         magicwand draws its overlay via this protocol; Hyprland supports it \
+         spawnhere draws its overlay via this protocol; Hyprland supports it \
          natively. If you're seeing this under Hyprland, your Hyprland version \
          may be too old — 0.30+ is recommended.",
     )?;
@@ -170,7 +170,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
 
     let surface = compositor_state.create_surface(&qh);
     let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("magicwand"), None);
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("spawnhere"), None);
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     layer.set_exclusive_zone(-1);
@@ -279,7 +279,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
 
             if state.configured && state.needs_redraw {
                 if let Err(e) = state.draw(&qh) {
-                    eprintln!("magicwand: draw failed: {e:#}");
+                    eprintln!("spawnhere: draw failed: {e:#}");
                 }
                 state.needs_redraw = false;
             }
