@@ -1,1 +1,7 @@
 /target
+
+# Demo capture lives locally; the hero clip is hosted on GitHub's
+# user-attachments CDN and referenced from the README.
+/assets/record-demo.sh
+/assets/demo.mp4
+/assets/demo.gif

@@ -1,171 +1,193 @@
+<div align="center">
+
 # spawnhere
 
-Draw a gesture on your Hyprland desktop → spawn a floating window exactly where you drew.
+**Draw where you want a window. Get a window.**
 
-> A launcher that skips the "where does the window go" problem: the rectangle you sketch *is* the window's final position and size.
+A launcher for Hyprland that skips the *"where does this go?"* step — the rectangle you sketch on screen **is** the window's final size and position.
 
-## What it looks like
+[![AUR version](https://img.shields.io/aur/version/spawnhere?color=1793d1&label=AUR&logo=arch-linux&logoColor=white)](https://aur.archlinux.org/packages/spawnhere)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Compositor: Hyprland](https://img.shields.io/badge/compositor-Hyprland-0c96c5)](https://hyprland.org)
+[![Vibecoded](https://img.shields.io/badge/100%25-vibecoded-ff6ec7?labelColor=1a1a2e)](#vibecoded)
 
-1. Press your bind (e.g. `Super+\``).
-2. The screen dims; you draw a rough area with the mouse.
-   - **Freehand**: just click and drag — the bounding box is the spawn area.
-   - **Rectangle**: hold `Shift` while dragging for a clean rounded rect.
-   - **Bare click**: no drag — the app opens at its own natural size at that point.
-3. Release — a fuzzy-matching app picker appears inside your drawing.
-4. Type / arrow-key / click to pick. The app spawns as a floating window at your drawn bbox.
+<br>
 
-Or skip the picker with `--term`, `--spawn <cmd>`, or `--default` (pinned app).
+<video src="https://github.com/user-attachments/assets/c5826039-14b3-48ac-bdbe-5c7b68ab2be2" autoplay loop muted playsinline width="720"></video>
 
-## Requirements
+</div>
 
-- **Compositor: Hyprland** (0.34+ recommended).
-- **Session**: Wayland.
-- **Runtime**: systemd-logind (for `$XDG_RUNTIME_DIR`).
+---
 
-spawnhere is intentionally Hyprland-only. It relies on `hyprctl dispatch exec` for the atomic "spawn floating at (x, y, w, h)" action that Sway / river / Wayfire don't expose in one shot. GNOME / KDE additionally don't advertise `zwlr_layer_shell_v1`, so the overlay can't even draw there.
+## Why
 
-## Install
+spawnhere flips the usual launcher flow. Instead of picking an app and then arranging its window, you describe the space first — sketch a rectangle anywhere on screen — and choose what fills it. The gesture doubles as the geometry: one motion decides both the target window and where it will live.
 
-### From source
+## Quickstart
+
+Install from the AUR:
 
 ```bash
-git clone https://github.com/yourname/spawnhere
-cd spawnhere
-cargo build --release
-install -Dm755 target/release/spawnhere ~/.local/bin/spawnhere
+yay -S spawnhere        # or paru, trizen, etc.
 ```
 
-### AUR (Arch Linux)
-
-```bash
-yay -S spawnhere
-# or, for the git tip
-yay -S spawnhere-git
-```
-
-(PKGBUILD lives in `packaging/aur/`.)
-
-## Hyprland binds
-
-The recommended pair uses one bind for "launch my pinned default app" and a Shift variant for "open the full picker":
+Add to `~/.config/hypr/hyprland.conf`:
 
 ```conf
-# Super + `        → spawn the pinned default app directly
-# Super + Shift + `→ open the picker (also how you change the pin)
-bind = SUPER, grave, exec, spawnhere --default
-bind = SUPER SHIFT, grave, exec, spawnhere
+bind = SUPER,       grave, exec, spawnhere --default   # quick-spawn pinned app
+bind = SUPER SHIFT, grave, exec, spawnhere             # open the picker
 ```
 
-Other patterns (see `examples/hyprland-binds.conf`):
+Reload (`hyprctl reload`). Press `Super+` `` ` `` → draw → release → pick an app.
 
-```conf
-# Gesture + always picker, no default concept
-bind = SUPER, grave, exec, spawnhere
+## How it works
 
-# Gesture + terminal, skip picker
-bind = SUPER, t, exec, spawnhere --term
+Three gestures, one bind:
 
-# Gesture + fixed app
-bind = SUPER ALT, b, exec, spawnhere --spawn "firefox"
-```
+| Gesture | Result |
+|---|---|
+| **Drag** any shape | Window spawns at the *bounding box* of what you drew. Freehand anything — a circle, a squiggle, the letter R — the bbox is the spawn zone. |
+| **Shift + drag** | Clean rounded rectangle, useful when you want a specific aspect ratio. |
+| **Click without dragging** | App opens at its *natural* size, centered on the click. |
 
-Then `hyprctl reload`.
+Release → a fuzzy picker appears inside your drawing. Type, `↵`, done.
 
-## CLI
-
-```
-spawnhere [OPTIONS]
-
-  -s, --spawn <CMD>        Spawn CMD directly at the drawn bbox (skips picker)
-  -t, --term               Shortcut for `--spawn $TERMINAL`
-  -d, --default            Spawn the pinned default app (Ctrl+P in the picker
-                           pins / unpins). Falls back to the picker if nothing
-                           is pinned. While the overlay is up, hold CTRL to
-                           escape to the picker for this spawn.
-      --padding <PX>       Extra pixels added to the bbox per side (default: 0)
-  -V, --version
-  -h, --help
-```
-
-## Picker keybindings
-
-Inside the picker:
+<details>
+<summary><b>Picker shortcuts</b></summary>
 
 | Key | Action |
 |---|---|
 | `↵` Enter | Launch the selected app |
 | `↑` / `↓` | Navigate |
 | `PgUp` / `PgDn` | Page through the list |
-| Letter keys | Fuzzy-filter by name (case-insensitive) |
-| `Backspace` | Delete a character from the search |
-| `Del` | Forget the selected recent app (drops it from history) |
-| `Ctrl + P` | Pin (or unpin) the selected app as the `--default` target |
-| `Esc` or right-click | Cancel |
+| Letter keys | Fuzzy-filter by name |
+| `Backspace` | Delete a search character |
+| `Del` | Forget the selected recent app |
+| `Ctrl + P` | Pin (or unpin) as the `--default` target — a ★ marks the pinned one |
+| `Esc` / right-click | Cancel |
 
-Mouse: click a row to launch, click the `×` on a recent row to forget, click outside the card to cancel.
+Mouse works too: click a row to launch, click the `×` on a recent row to forget, click outside the card to cancel.
 
-Pinned apps show a ★ next to their name; the `Ctrl+P` hint in the footer flips to **★ Unpin** (gold) when the current selection is the pinned one.
+</details>
 
-## Pin workflow
+## CLI
 
-1. First time: `Super+\`` → overlay appears. Nothing is pinned, so it falls through to the picker.
-2. Pick your favourite app, press `Ctrl + P` → a one-shot panel explains the binds and a ★ appears next to the name.
-3. Press `Enter` (or `Esc`) to dismiss.
-4. Next time: `Super+\`` → draw → the pinned app spawns directly, no picker.
-5. To change: `Super+Shift+\`` → picker → navigate → `Ctrl + P` again on the new app.
-6. To escape the pin for one spawn: with `Super+\``, hold `Ctrl` while drawing — the picker opens on release.
+```
+spawnhere [OPTIONS]
+
+  -s, --spawn <CMD>     Spawn CMD directly at the drawn bbox (skip picker)
+  -t, --term            Shortcut for --spawn $TERMINAL
+  -d, --default         Spawn the pinned default app (Ctrl+P in picker to pin)
+      --padding <PX>    Extra pixels added around the bbox (default: 0)
+  -h, --help
+  -V, --version
+```
+
+Hold `Ctrl` while drawing with `--default` to escape the pin and open the picker once.
+
+More bind patterns in [`examples/hyprland-binds.conf`](examples/hyprland-binds.conf).
 
 ## Config
 
-Optional `~/.config/spawnhere/config.toml`:
+Optional: `~/.config/spawnhere/config.toml`
 
 ```toml
-default_term = "kitty"         # fallback for --term if $TERMINAL unset
+default_term = "kitty"         # --term fallback when $TERMINAL is unset
 
 [rules.kitty]
 min_width = 480
-cell_px = [10, 22]             # snap to terminal cell grid
+cell_px = [10, 22]             # snap terminal bboxes to the cell grid
 
 [rules.firefox]
 min_width = 1200
 min_height = 800
 ```
 
-See `examples/config.toml` for the full, commented reference.
+Rules match on the first path component of the chosen exec
+(`/usr/bin/kitty -1 fish` → `[rules.kitty]`). The `min_*` floors apply **only when you drew a bbox** — bare clicks preserve the app's natural size.
 
-| Key | Type | Meaning |
-|---|---|---|
-| `default_term` | string | `--term` fallback when `$TERMINAL` is unset |
-| `rules.<class>.min_width` | u32 | Floor for bbox width (applies only when the user drew a bbox — bare clicks keep the app's natural size) |
-| `rules.<class>.min_height` | u32 | Floor for bbox height (same caveat) |
-| `rules.<class>.cell_px` | `[u32, u32]` | Round bbox w/h down to nearest multiple of `[cell_w, cell_h]` — useful for terminals |
+Full commented reference: [`examples/config.toml`](examples/config.toml).
 
-Rule matching uses the first path component of the chosen exec: `/usr/bin/kitty -1 fish` → `[rules.kitty]`.
+## Requirements
 
-## MRU
+- **Hyprland** 0.34+
+- A **Wayland** session
+- `systemd-logind` (for `$XDG_RUNTIME_DIR`)
 
-Every spawn appends the exec to `~/.local/share/spawnhere/history`. When the query is empty, the picker sorts recent picks to the top under a "Recent" section header, then everything else below under "Other apps". Delete the file to reset, or press `Del` on a row to forget it.
+<details>
+<summary><b>Why Hyprland-only?</b></summary>
 
-## Pinned default
+spawnhere leans on `hyprctl dispatch exec` to perform the atomic
+*"spawn floating at (x, y, w, h)"* action in a single shot. Sway, river and Wayfire don't expose that; GNOME and KDE don't advertise `zwlr_layer_shell_v1`, so the overlay cannot even draw. A per-compositor backend is possible but not on the roadmap.
 
-The `--default` target is stored in `~/.local/share/spawnhere/default` (single line holding the exec string). Pin/unpin via `Ctrl + P` in the picker, or delete the file to reset.
+</details>
 
-## Multi-monitor
+## Advanced
 
-The overlay appears on whichever monitor Hyprland decides is "active" when the bind fires (typically the one with focus). Drawing happens on that monitor; the spawned window lands on the same one. To use spawnhere on another monitor, focus it first (hover or keyboard-switch) and then press the bind.
+<details>
+<summary><b>Multi-monitor</b></summary>
 
-### Bar / panel safe-area
+The overlay appears on whichever monitor Hyprland considers "active" when the bind fires — usually the one with focus. The spawned window lands on the same monitor. To use spawnhere on another display, focus it first (hover or keyboard-switch) and then press the bind.
 
-If you run a top bar (Quickshell, Waybar, eww, etc.), spawnhere queries `hyprctl layers -j` at spawn time to find any layer-shells anchored to an edge and clamps the final bbox to the usable area — so windows never land behind your bar, even when the bar uses `exclusiveZone = 0` (Ignore mode) and doesn't show up in the compositor's `reserved` array.
+</details>
 
-## HiDPI
+<details>
+<summary><b>Bar / panel safe-area</b></summary>
 
-The overlay honors the compositor's advertised scale factor via `scale_factor_changed` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density; icons are rasterized at `24 × scale` pixels.
+If you run a top bar (Quickshell, Waybar, eww…), spawnhere queries `hyprctl layers -j` at spawn time, finds every edge-anchored layer-shell, and clamps the final bbox to the usable area. Windows never land behind your bar — even when it uses `exclusiveZone = 0` (Ignore mode) and doesn't show up in the compositor's `reserved` array.
 
-## Typography
+</details>
 
-The picker ships with **Inter Variable** embedded in the binary (Open Font License 1.1, `assets/fonts/`). The UI looks identical on any machine, independent of the system's `sans-serif` resolution.
+<details>
+<summary><b>HiDPI</b></summary>
+
+Honors the compositor's advertised scale factor via `scale_factor_changed` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density; icons are rasterized at `24 × scale` pixels.
+
+</details>
+
+<details>
+<summary><b>Recent apps & pinning</b></summary>
+
+Every spawn appends the exec to `~/.local/share/spawnhere/history`. With an empty query the picker sorts recents to the top under *"Recent"*, then everything else under *"Other apps"*. Delete the file to reset, or press `Del` on a row to forget it.
+
+The pinned `--default` target is stored in `~/.local/share/spawnhere/default` (single line, the exec string). Pin/unpin via `Ctrl + P` in the picker, or delete the file to reset.
+
+</details>
+
+<details>
+<summary><b>Typography</b></summary>
+
+Ships with [Inter Variable](https://rsms.me/inter/) embedded in the binary (Open Font License 1.1, `assets/fonts/`). The UI looks identical on any machine, independent of the system's `sans-serif` resolution.
+
+</details>
+
+## Build from source
+
+```bash
+git clone https://github.com/revmnds/spawnhere
+cd spawnhere
+cargo build --release
+install -Dm755 target/release/spawnhere ~/.local/bin/spawnhere
+```
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+## Contributing
+
+Bug reports and ideas welcome — [open an issue](https://github.com/revmnds/spawnhere/issues). For patches: small, focused PRs land fastest. The codebase is a single binary (~1.5k LOC) with unit tests for the geometry and picker logic.
+
+## <a id="vibecoded"></a>Vibecoded
+
+This project is **100% vibecoded** — every line of Rust, every pixel of the overlay, every test was written by [Claude](https://claude.ai) under my direction. I described what I wanted ("draw a gesture, spawn a window there, Hyprland only"), Claude translated intent into code, I steered the details and made final calls.
+
+If you're new to this style of building: it's not *"AI generated the code so it's probably slop."* It's pair programming where you keep the wheel but your partner types at 10,000 WPM. The final output still has to work, the tests still have to pass, the UX still has to feel right — those calls are mine.
+
+Read the code. It's small. It's commented. It's honest about what it is.
 
 ## License
 
-MIT. See also `assets/fonts/OFL.txt` for Inter's license.
+[MIT](LICENSE) · Inter font under [OFL](assets/fonts/OFL.txt).
