@@ -1,5 +1,6 @@
 use crate::apps::App;
 use crate::history::History;
+use crate::pinned::Pinned;
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher, Utf32Str,
@@ -27,6 +28,12 @@ pub struct PickerState {
     scroll_offset: usize,
     matcher: Matcher,
     history: History,
+    pinned: Pinned,
+    /// Flipped to true the first time the user pins in a given picker session,
+    /// stays on until the picker closes. Drives the one-shot onboarding toast
+    /// that explains both binds — so a first-timer doesn't get trapped in
+    /// "I pinned it, now what?".
+    welcome_toast: bool,
 }
 
 impl PickerState {
@@ -39,6 +46,8 @@ impl PickerState {
             scroll_offset: 0,
             matcher: Matcher::new(Config::DEFAULT),
             history,
+            pinned: Pinned::load(),
+            welcome_toast: false,
         }
     }
 
@@ -144,6 +153,40 @@ impl PickerState {
         Some(exec)
     }
 
+    /// True if the app at absolute index `abs` is the currently-pinned
+    /// "default" — renderer uses this to draw the star glyph next to the name.
+    pub fn is_pinned_row(&self, abs: usize) -> bool {
+        self.matches
+            .get(abs)
+            .map(|m| self.pinned.is(&self.apps[m.app_idx].exec))
+            .unwrap_or(false)
+    }
+
+    /// Toggle pinned state on the currently-selected row. Pinning a new app
+    /// replaces the previous default; pinning the same row again clears it.
+    /// Persists to disk synchronously. The first *set* per session also
+    /// arms the welcome toast.
+    pub fn toggle_pin_selected(&mut self) {
+        let Some(m) = self.matches.get(self.selected) else {
+            return;
+        };
+        let exec = self.apps[m.app_idx].exec.clone();
+        if self.pinned.is(&exec) {
+            self.pinned.clear();
+        } else {
+            self.pinned.set(&exec);
+            self.welcome_toast = true;
+        }
+    }
+
+    /// True if the onboarding toast should render this frame. Flips on at the
+    /// first pin of the session and stays on until the picker closes — the
+    /// user gets one uninterrupted chance to see it without a timer that
+    /// might disappear mid-read.
+    pub fn welcome_toast(&self) -> bool {
+        self.welcome_toast
+    }
+
     /// Scroll the viewport by `delta` rows without moving the selection.
     /// Selection may drift off-screen; up/down keys will snap it back.
     pub fn scroll_by(&mut self, delta: isize) {
@@ -166,16 +209,23 @@ impl PickerState {
 
     /// Rebuild the filtered+scored list from the current query. Empty query
     /// orders by history only (most-used + most-recent on top); non-empty
-    /// query uses fuzzy score + history bonus.
+    /// query uses fuzzy score + history bonus. The pinned "default" app gets
+    /// a strong bonus so it lands at the top of the empty-query list — the
+    /// user opens the picker and immediately sees the pinned row selected,
+    /// with the footer showing "Unpin" in place of "Pin".
     fn refilter(&mut self) {
+        const PIN_BONUS: u32 = 1_000_000;
         if self.query.is_empty() {
             let mut scored: Vec<ScoredMatch> = self
                 .apps
                 .iter()
                 .enumerate()
-                .map(|(i, app)| ScoredMatch {
-                    app_idx: i,
-                    score: self.history.score_bonus(&app.exec),
+                .map(|(i, app)| {
+                    let mut score = self.history.score_bonus(&app.exec);
+                    if self.pinned.is(&app.exec) {
+                        score = score.saturating_add(PIN_BONUS);
+                    }
+                    ScoredMatch { app_idx: i, score }
                 })
                 .collect();
             scored.sort_by(|a, b| {

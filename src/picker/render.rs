@@ -1,21 +1,41 @@
 use super::{PickerState, TextRenderer, VISIBLE_ITEMS};
 use crate::apps::IconCache;
+use cosmic_text::Weight;
 use tiny_skia::{
     FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform,
 };
 
 pub const CARD_WIDTH: u32 = 600;
 
-const CARD_PADDING: i32 = 20;
-const SEARCH_HEIGHT: i32 = 48;
-const SEPARATOR_GAP: i32 = 12;
+// Spacing scale — all paddings/gaps pick from here so visual rhythm stays
+// consistent and tuning one value doesn't leave stragglers behind.
+const SPACE_XS: i32 = 4;
+const SPACE_SM: i32 = 8;
+const SPACE_MD: i32 = 12;
+const SPACE_XL: i32 = 20;
+
+// Font scale. INPUT is the largest (primary affordance), BODY the row name,
+// HEADER/HINT the quiet supporting text. Keep these in sync with the spacing
+// scale: larger text wants more breathing room.
+const FONT_INPUT: f32 = 15.0;
+const FONT_BODY: f32 = 14.0;
+const FONT_HEADER: f32 = 11.0;
+const FONT_HINT: f32 = 11.0;
+
+const CARD_PADDING: i32 = SPACE_XL;
+const SEARCH_HEIGHT: i32 = 44;
+const SEPARATOR_GAP: i32 = SPACE_MD;
 const ITEM_HEIGHT: i32 = 40;
 const ICON_SIZE: u32 = 24;
 const SCROLL_RAIL_W: i32 = 3;
-const SCROLL_RAIL_GAP: i32 = 4;
-/// Vertical space for the "Recent" section header. Only added when at least
-/// one previously-picked app is visible.
+const SCROLL_RAIL_GAP: i32 = SPACE_XS;
+/// Vertical space for the "Recent" / "Other apps" section headers.
 const SECTION_HEADER_H: i32 = 22;
+/// Footer strip holding keyboard hints. Discoverability without docs.
+const FOOTER_HEIGHT: i32 = 28;
+/// One-shot onboarding toast shown after the user's first pin this session.
+/// Explains how to launch/change the default so they don't get trapped.
+const TOAST_HEIGHT: i32 = 44;
 /// Square hit-box for the × "forget" button on history rows (logical px).
 const FORGET_BTN_SIZE: i32 = 22;
 /// Right-edge inset for the × button within a row.
@@ -54,7 +74,14 @@ fn section_headers(state: &PickerState) -> (bool, bool) {
 fn card_height(state: &PickerState) -> i32 {
     let (show_recent, show_others) = section_headers(state);
     let hdr_space = (show_recent as i32 + show_others as i32) * SECTION_HEADER_H;
-    CARD_PADDING * 2 + SEARCH_HEIGHT + SEPARATOR_GAP + hdr_space + list_rows(state) * ITEM_HEIGHT
+    let toast = if state.welcome_toast() { TOAST_HEIGHT } else { 0 };
+    CARD_PADDING * 2
+        + SEARCH_HEIGHT
+        + SEPARATOR_GAP
+        + hdr_space
+        + list_rows(state) * ITEM_HEIGHT
+        + toast
+        + FOOTER_HEIGHT
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +96,11 @@ pub struct CardRect {
     pub others_header_y: Option<i32>,
     /// Number of visible recent rows; informs `item_at` skip-over math.
     pub recent_count: u32,
+    /// Right edge of the × button (logical px). Stored on the card because the
+    /// scroll rail eats `SCROLL_RAIL_W + SCROLL_RAIL_GAP` from the row's right
+    /// edge once the list overflows, and the hit-box must shift left by that
+    /// same amount to stay aligned with the painted button.
+    pub forget_btn_right: i32,
 }
 
 impl CardRect {
@@ -114,13 +146,51 @@ impl CardRect {
         }
     }
 
-    /// True if the click landed inside the × forget button of a row. The
+    /// True if the cursor is inside the × forget button's painted area. The
     /// caller still needs to confirm the row is a history row — the × is
     /// hidden for non-history rows but the hit-box is cheap either way.
-    pub fn forget_button_hit(&self, px: i32, _py: i32) -> bool {
-        let right = self.x + self.w as i32 - CARD_PADDING - FORGET_BTN_INSET;
+    /// Both X and Y are checked: the button is 22 px tall but rows are 40 px,
+    /// so without the Y bounds a click in the row's top/bottom 9 px gutter
+    /// near the button's X column would be treated as a delete.
+    pub fn forget_button_hit(&self, px: i32, py: i32) -> bool {
+        let right = self.forget_btn_right;
         let left = right - FORGET_BTN_SIZE;
-        px >= left && px < right
+        if px < left || px >= right {
+            return false;
+        }
+        let Some(row_top) = self.row_top_for_y(py) else {
+            return false;
+        };
+        let btn_top = row_top + (ITEM_HEIGHT - FORGET_BTN_SIZE) / 2;
+        py >= btn_top && py < btn_top + FORGET_BTN_SIZE
+    }
+
+    /// Top-y of the row containing `py`, or None if `py` is outside any row
+    /// (header strips, empty space). Mirrors `item_at`'s row math.
+    fn row_top_for_y(&self, py: i32) -> Option<i32> {
+        let first_row = self.y
+            + CARD_PADDING
+            + SEARCH_HEIGHT
+            + SEPARATOR_GAP
+            + if self.recent_header_y.is_some() { SECTION_HEADER_H } else { 0 };
+        if py < first_row {
+            return None;
+        }
+        let recent = self.recent_count as i32;
+        let post_recent = first_row + recent * ITEM_HEIGHT;
+        if self.others_header_y.is_some() && py >= post_recent && py < post_recent + SECTION_HEADER_H {
+            return None;
+        }
+        let others_offset = if self.others_header_y.is_some() && py >= post_recent + SECTION_HEADER_H {
+            SECTION_HEADER_H
+        } else {
+            0
+        };
+        let local = py - first_row - others_offset;
+        if local < 0 {
+            return None;
+        }
+        Some(first_row + others_offset + (local / ITEM_HEIGHT) * ITEM_HEIGHT)
     }
 }
 
@@ -134,6 +204,7 @@ pub fn draw(
     surface_size: (u32, u32),
     caret_visible: bool,
     hovered_rel: Option<usize>,
+    forget_hover_rel: Option<usize>,
     scale: u32,
 ) -> CardRect {
     let cw = CARD_WIDTH as i32;
@@ -187,6 +258,16 @@ pub fn draw(
     } else {
         None
     };
+    // Decide whether the rail will be drawn before painting rows so the
+    // forget-button X math can match what `draw_list` actually paints.
+    let needs_rail = state.match_count() > VISIBLE_ITEMS;
+    let row_w = if needs_rail {
+        list_w - SCROLL_RAIL_W - SCROLL_RAIL_GAP
+    } else {
+        list_w
+    };
+    let forget_btn_right = list_x + row_w - FORGET_BTN_INSET;
+
     draw_list(
         pixmap,
         text,
@@ -196,10 +277,19 @@ pub fn draw(
         cursor_y,
         list_w,
         hovered_rel,
+        forget_hover_rel,
         scale,
         recent_count as usize,
         show_others,
     );
+
+    let footer_y = y + ch - FOOTER_HEIGHT;
+    if state.welcome_toast() {
+        let toast_y = footer_y - TOAST_HEIGHT;
+        draw_welcome_toast(pixmap, text, x + CARD_PADDING, toast_y, cw - 2 * CARD_PADDING, scale);
+    }
+    let pinned_selected = state.is_pinned_row(state.selected_index());
+    draw_footer(pixmap, text, x, footer_y, cw, scale, pinned_selected);
 
     CardRect {
         x,
@@ -209,6 +299,7 @@ pub fn draw(
         recent_header_y,
         others_header_y,
         recent_count,
+        forget_btn_right,
     }
 }
 
@@ -274,56 +365,62 @@ fn draw_search(
         pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
     }
 
-    let prompt_x = x + 14;
-    let prompt_y = y + 12;
+    // Column alignment with the row list below: rows have icon at x+SPACE_SM
+    // (24 px wide) and name at x+44, with a 12 px gap between icon edge and
+    // name. Mirror that here so the search text and app names share a baseline.
+    let prompt_size: f32 = 18.0;
+    let prompt_x = x + SPACE_SM + 2;
+    let prompt_y = y + (SEARCH_HEIGHT - prompt_size as i32) / 2;
     text.draw(
         pixmap,
         prompt_x * s_i,
         prompt_y * s_i,
         "🔍",
-        18.0 * s_f,
-        24.0 * s_f,
+        prompt_size * s_f,
+        prompt_size * s_f,
         (176, 128, 255, 255),
     );
 
-    let text_x = x + 50;
-    let text_y = y + 12;
+    let text_x = x + SPACE_SM + ICON_SIZE as i32 + SPACE_MD;
+    let text_y = y + (SEARCH_HEIGHT - FONT_INPUT as i32) / 2 - 1;
     let query_width_phys = if query.is_empty() {
         let placeholder = if loading {
             "Loading apps…"
         } else {
             "Type to search"
         };
-        text.draw(
+        text.draw_weighted(
             pixmap,
             text_x * s_i,
             text_y * s_i,
             placeholder,
-            18.0 * s_f,
-            (w - 60) as f32 * s_f,
+            FONT_INPUT * s_f,
+            (w - (text_x - x) - SPACE_SM) as f32 * s_f,
             (130, 130, 140, 255),
+            Weight::NORMAL,
         );
         0.0
     } else {
-        text.draw(
+        text.draw_weighted(
             pixmap,
             text_x * s_i,
             text_y * s_i,
             query,
-            18.0 * s_f,
-            (w - 60) as f32 * s_f,
+            FONT_INPUT * s_f,
+            (w - (text_x - x) - SPACE_SM) as f32 * s_f,
             (235, 235, 240, 255),
+            Weight::MEDIUM,
         );
-        text.measure_width(query, 18.0 * s_f)
+        text.measure_width_weighted(query, FONT_INPUT * s_f, Weight::MEDIUM)
     };
 
     if caret_visible {
         // Caret position is in PHYSICAL pixels because query_width_phys is
         // physical. Draw with identity transform against the physical pixmap.
         let caret_x_phys = text_x as f32 * s_f + query_width_phys + 1.0 * s_f;
-        let caret_y_phys = (text_y as f32 + 4.0) * s_f;
+        let caret_y_phys = (text_y as f32 + 2.0) * s_f;
         let caret_w_phys = 2.0 * s_f;
-        let caret_h_phys = 22.0 * s_f;
+        let caret_h_phys = (FONT_INPUT + 4.0) * s_f;
         let mut caret = Paint::default();
         caret.set_color_rgba8(176, 128, 255, 255);
         if let Some(rect) =
@@ -353,6 +450,7 @@ fn draw_list(
     y_start: i32,
     w: i32,
     hovered_rel: Option<usize>,
+    forget_hover_rel: Option<usize>,
     scale: u32,
     recent_count: usize,
     show_others_header: bool,
@@ -368,11 +466,11 @@ fn draw_list(
     if state.match_count() == 0 {
         text.draw(
             pixmap,
-            (x + 8) * s_i,
+            (x + SPACE_SM) * s_i,
             (y_start + 10) * s_i,
             "No results",
-            14.0 * s_f,
-            (w - 16) as f32 * s_f,
+            FONT_BODY * s_f,
+            (w - 2 * SPACE_SM) as f32 * s_f,
             (130, 130, 140, 255),
         );
         return;
@@ -420,8 +518,11 @@ fn draw_list(
                 pixmap.fill_rect(rect, &bar, t, None);
             }
         } else if is_hovered {
+            // Bumped from alpha 16 → 36: the old value was too faint to read
+            // as feedback on most monitors, especially against the card's
+            // already-dark background.
             let mut hv = Paint::default();
-            hv.set_color_rgba8(255, 255, 255, 16);
+            hv.set_color_rgba8(255, 255, 255, 36);
             if let Some(path) = rounded_rect_path(
                 x as f32,
                 row_y as f32 + 2.0,
@@ -433,7 +534,7 @@ fn draw_list(
             }
         }
 
-        let icon_x = x + 8;
+        let icon_x = x + SPACE_SM;
         let icon_y = row_y + (ITEM_HEIGHT - ICON_SIZE as i32) / 2;
         let mut drew_icon = false;
         if let Some(icon_name) = app.icon.as_deref() {
@@ -456,7 +557,7 @@ fn draw_list(
             draw_fallback_icon(pixmap, text, icon_x, icon_y, &app.name, abs, scale);
         }
 
-        let name_x = icon_x + ICON_SIZE as i32 + 12;
+        let name_x = icon_x + ICON_SIZE as i32 + SPACE_MD;
         let name_y = row_y + 10;
         let name_color = if selected {
             (255, 255, 255, 255)
@@ -469,26 +570,51 @@ fn draw_list(
         // the space reservation is constant to avoid reflow on hover.
         let is_history = state.is_history_row(abs);
         let name_right_reserve = if is_history {
-            FORGET_BTN_SIZE + FORGET_BTN_INSET + 4
+            FORGET_BTN_SIZE + FORGET_BTN_INSET + SPACE_XS
         } else {
-            8
+            SPACE_SM
         };
-        text.draw(
+        let name_weight = if selected { Weight::MEDIUM } else { Weight::NORMAL };
+        text.draw_weighted(
             pixmap,
             name_x * s_i,
             name_y * s_i,
             &app.name,
-            14.0 * s_f,
+            FONT_BODY * s_f,
             (list_w - (name_x - x) - name_right_reserve) as f32 * s_f,
             name_color,
+            name_weight,
         );
+
+        // Pin indicator — a small star after the name if this row is the
+        // current default. Positioned after the text using measure_width so
+        // it sticks to the name regardless of length.
+        if state.is_pinned_row(abs) {
+            let name_w_phys = text.measure_width_weighted(&app.name, FONT_BODY * s_f, name_weight);
+            let star_x_phys = name_x as f32 * s_f + name_w_phys + SPACE_SM as f32 * s_f;
+            let star_color = if selected {
+                (255, 220, 110, 255)
+            } else {
+                (220, 190, 90, 220)
+            };
+            text.draw(
+                pixmap,
+                star_x_phys as i32,
+                name_y * s_i,
+                "★",
+                FONT_BODY * s_f,
+                FONT_BODY * s_f * 1.5,
+                star_color,
+            );
+        }
 
         // × button — visible on selected OR hovered rows that have history.
         if is_history && (selected || is_hovered) {
             let btn_right = x + list_w - FORGET_BTN_INSET;
             let btn_left = btn_right - FORGET_BTN_SIZE;
             let btn_top = row_y + (ITEM_HEIGHT - FORGET_BTN_SIZE) / 2;
-            draw_forget_button(pixmap, btn_left, btn_top, FORGET_BTN_SIZE, selected, scale);
+            let btn_hovered = forget_hover_rel == Some(i);
+            draw_forget_button(pixmap, btn_left, btn_top, FORGET_BTN_SIZE, selected, btn_hovered, scale);
         }
     }
 
@@ -497,10 +623,21 @@ fn draw_list(
     }
 }
 
-fn draw_forget_button(pixmap: &mut Pixmap, x: i32, y: i32, size: i32, prominent: bool, scale: u32) {
+fn draw_forget_button(
+    pixmap: &mut Pixmap,
+    x: i32,
+    y: i32,
+    size: i32,
+    prominent: bool,
+    hovered: bool,
+    scale: u32,
+) {
     let t = scale_tf(scale);
-    // Subtle filled circle behind the ×. Brighter when the row is selected.
-    let (bg_r, bg_g, bg_b, bg_a) = if prominent {
+    // Hovered state takes precedence so the destructive intent reads even on
+    // a selected row (which is purple, the same hue family as the picker).
+    let (bg_r, bg_g, bg_b, bg_a) = if hovered {
+        (220, 80, 80, 230)
+    } else if prominent {
         (176, 128, 255, 96)
     } else {
         (180, 180, 200, 60)
@@ -513,11 +650,16 @@ fn draw_forget_button(pixmap: &mut Pixmap, x: i32, y: i32, size: i32, prominent:
         pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
     }
 
-    // × itself — two crossed strokes.
+    // × itself — two crossed strokes. Heavier and pure white on hover.
+    let (fg_r, fg_g, fg_b, fg_a, sw) = if hovered {
+        (255, 255, 255, 255, 2.0)
+    } else {
+        (235, 235, 240, 255, 1.6)
+    };
     let mut fg = Paint::default();
-    fg.set_color_rgba8(235, 235, 240, 255);
+    fg.set_color_rgba8(fg_r, fg_g, fg_b, fg_a);
     fg.anti_alias = true;
-    let stroke = tiny_skia::Stroke { width: 1.6, ..Default::default() };
+    let stroke = tiny_skia::Stroke { width: sw, ..Default::default() };
     let pad = 6.0;
     let mut pb = PathBuilder::new();
     pb.move_to(x as f32 + pad, y as f32 + pad);
@@ -586,16 +728,196 @@ fn draw_section_header(
 ) {
     let s_i = scale as i32;
     let s_f = scale as f32;
-    // Faint uppercase label — design cue that this is a grouping, not an app row.
+    // SemiBold + uppercase + tracked: the standard "this is a section divider,
+    // not a row" treatment used in command palettes (Raycast, Cmd-K).
+    let upper = label.to_uppercase();
+    text.draw_weighted(
+        pixmap,
+        (x + SPACE_XS + 2) * s_i,
+        (y + SPACE_XS) * s_i,
+        &upper,
+        FONT_HEADER * s_f,
+        200.0 * s_f,
+        (150, 150, 165, 220),
+        Weight::SEMIBOLD,
+    );
+}
+
+/// One-shot panel shown after the user's first pin, teaching the two binds.
+/// Uses the same vaporwave pink/cyan + gold star accents as the stroke so the
+/// moment reads as "something just happened", not as a generic alert.
+fn draw_welcome_toast(pixmap: &mut Pixmap, text: &mut TextRenderer, x: i32, y: i32, w: i32, scale: u32) {
+    let t = scale_tf(scale);
+    let s_i = scale as i32;
+    let s_f = scale as f32;
+
+    // Pill background tinted toward the pink pulse hue.
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(42, 28, 56, 230);
+    bg.anti_alias = true;
+    if let Some(path) = rounded_rect_path(x as f32, y as f32, w as f32, TOAST_HEIGHT as f32, 10.0) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
+        let mut border = Paint::default();
+        border.set_color_rgba8(255, 60, 200, 140);
+        border.anti_alias = true;
+        let stroke = tiny_skia::Stroke { width: 1.0, ..Default::default() };
+        pixmap.stroke_path(&path, &border, &stroke, t, None);
+    }
+
+    // Line 1: "★ Pinned!" — gold star + bold white label.
+    let line1_y = y + 6;
+    let star = "★";
+    let star_size = FONT_BODY * s_f;
     text.draw(
         pixmap,
-        (x + 6) * s_i,
-        (y + 4) * s_i,
-        label,
-        11.0 * s_f,
-        200.0 * s_f,
-        (150, 150, 165, 200),
+        (x + 12) * s_i,
+        line1_y * s_i,
+        star,
+        star_size,
+        star_size * 1.5,
+        (255, 220, 110, 255),
     );
+    let star_w = text.measure_width(star, star_size);
+    text.draw_weighted(
+        pixmap,
+        ((x + 12) as f32 * s_f + star_w + 6.0 * s_f) as i32,
+        line1_y * s_i,
+        "Pinned!",
+        FONT_BODY * s_f,
+        200.0 * s_f,
+        (255, 255, 255, 255),
+        Weight::SEMIBOLD,
+    );
+
+    // Line 2: the two binds, explained.
+    let line2_y = y + TOAST_HEIGHT - FONT_HINT as i32 - 6;
+    text.draw(
+        pixmap,
+        (x + 12) * s_i,
+        line2_y * s_i,
+        "Super+` launches it  ·  Super+Shift+` to pick another",
+        FONT_HINT * s_f,
+        (w - 24) as f32 * s_f,
+        (200, 200, 215, 230),
+    );
+}
+
+/// Bottom strip with keyboard hints. Keys render in Medium for affordance,
+/// labels in Normal. The Pin/Unpin label flips based on whether the
+/// currently-selected app is the pinned default — so a user who accidentally
+/// pinned something sees how to undo it without guessing.
+fn draw_footer(
+    pixmap: &mut Pixmap,
+    text: &mut TextRenderer,
+    x: i32,
+    y: i32,
+    w: i32,
+    scale: u32,
+    pinned_selected: bool,
+) {
+    let t = scale_tf(scale);
+    let s_i = scale as i32;
+    let s_f = scale as f32;
+
+    // Top separator line — same color/weight as the search/list separator so
+    // the footer reads as a peer to the input, not a stuck-on bar.
+    let mut sep = Paint::default();
+    sep.set_color_rgba8(60, 62, 75, 200);
+    if let Some(rect) = Rect::from_xywh(
+        (x + CARD_PADDING) as f32,
+        y as f32,
+        (w - 2 * CARD_PADDING) as f32,
+        1.0,
+    ) {
+        pixmap.fill_rect(rect, &sep, t, None);
+    }
+
+    // Hints: each is (key, label). Keys render in Medium so the eye picks them
+    // out; labels in Normal stay quiet. Separator middle dot between groups.
+    // Pin hint flips when the selection is the pinned default so the user
+    // can always see how to undo it. A prefixed ★ glyph + warm color make
+    // the Unpin state obvious at a glance — same star that appears on the row.
+    let pin_label = if pinned_selected { "★ Unpin" } else { "Pin" };
+    let hints: &[(&str, &str)] = &[
+        ("↵", "Open"),
+        ("↑↓", "Navigate"),
+        ("^P", pin_label),
+        ("Del", "Forget"),
+        ("Esc", "Close"),
+    ];
+
+    let key_color = (210, 210, 220, 230);
+    let label_color = (140, 140, 155, 220);
+    let dot_color = (90, 92, 105, 200);
+    let key_pad: f32 = 4.0;
+    let label_pad: f32 = 14.0;
+    let dot = " · ";
+    let dot_w = text.measure_width(dot, FONT_HINT * s_f);
+
+    // Two-pass: measure first to right-align the whole strip with a small
+    // right inset. This avoids the hint cluster jittering left/right as
+    // labels change length in future iterations.
+    let mut total_w = 0.0_f32;
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            total_w += dot_w;
+        }
+        total_w += text.measure_width_weighted(key, FONT_HINT * s_f, Weight::MEDIUM);
+        total_w += key_pad * s_f;
+        total_w += text.measure_width(label, FONT_HINT * s_f);
+        if i + 1 < hints.len() {
+            total_w += label_pad * s_f - dot_w;
+        }
+    }
+
+    let strip_right = (x + w - CARD_PADDING) as f32 * s_f;
+    let mut cursor = strip_right - total_w;
+    let baseline_y = (y + (FOOTER_HEIGHT - FONT_HINT as i32) / 2) * s_i;
+
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            text.draw(
+                pixmap,
+                cursor as i32,
+                baseline_y,
+                dot,
+                FONT_HINT * s_f,
+                dot_w + 2.0 * s_f,
+                dot_color,
+            );
+            cursor += dot_w;
+        }
+        let kw = text.measure_width_weighted(key, FONT_HINT * s_f, Weight::MEDIUM);
+        text.draw_weighted(
+            pixmap,
+            cursor as i32,
+            baseline_y,
+            key,
+            FONT_HINT * s_f,
+            kw + 2.0 * s_f,
+            key_color,
+            Weight::MEDIUM,
+        );
+        cursor += kw + key_pad * s_f;
+        let lw = text.measure_width(label, FONT_HINT * s_f);
+        // "Unpin" state gets the same warm gold used on the row star so the
+        // eye links the footer affordance to the marker visible on the list.
+        let this_color = if label.starts_with('★') {
+            (255, 220, 110, 240)
+        } else {
+            label_color
+        };
+        text.draw(
+            pixmap,
+            cursor as i32,
+            baseline_y,
+            label,
+            FONT_HINT * s_f,
+            lw + 2.0 * s_f,
+            this_color,
+        );
+        cursor += lw;
+    }
 }
 
 fn draw_scroll_rail(

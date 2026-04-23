@@ -36,7 +36,8 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::Proxy;
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
+use cosmic_text::Weight;
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
@@ -64,15 +65,31 @@ const CARET_BLINK_MS: u128 = 530;
 /// How often we wake the loop to redraw the caret. Half the half-period so we
 /// never miss a transition.
 const BLINK_TICK: Duration = Duration::from_millis(265);
+/// Shimmer tick for the stroke gradient animation. ~30 fps — fast enough to
+/// look smooth, slow enough to stay cheap. The timer only actually dirties
+/// the surface when a stroke is being drawn or previewed.
+const SHIMMER_TICK: Duration = Duration::from_millis(33);
+/// Full travel time of the shimmer pulse along the stroke, in seconds.
+/// Short = energetic, long = calm. 2.5 s reads as "alive but not distracting".
+const SHIMMER_CYCLE_S: f32 = 2.5;
 
 fn caret_visible_at(since_reset: Duration) -> bool {
     (since_reset.as_millis() / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 const BG_DIM_ALPHA: u8 = 64;
-const STROKE_COLOR: (u8, u8, u8, u8) = (176, 128, 255, 255);
+/// Saturated vaporwave-lila as the resting stroke color. The dual-hue pulses
+/// (magenta + cyan) ride on top of this base.
+const STROKE_COLOR: (u8, u8, u8, u8) = (170, 100, 255, 255);
 const STROKE_WIDTH: f32 = 4.0;
 const STROKE_DIM_ALPHA: u8 = 102; // ~0.4 * 255 — used during Picking phase
+/// Two pulse hues that travel along the stroke — pink and cyan in opposing
+/// phase produces a synthwave / chromatic-aberration feel as they cross the
+/// midpoint together.
+const PULSE_COLORS: &[(u8, u8, u8)] = &[
+    (255, 60, 200),  // hot magenta
+    (80, 230, 255),  // electric cyan
+];
 
 #[derive(Clone, PartialEq)]
 enum Decision {
@@ -121,6 +138,9 @@ struct AppState {
     /// is replaced with a clean rectangle from press point to current cursor
     /// instead of capturing freehand points.
     shift_held: bool,
+    /// Live Ctrl modifier — used by Ctrl+P in the picker to pin the selected
+    /// app as the default (for `spawnhere --default`).
+    ctrl_held: bool,
     /// Press-point of a rectangle drag. `Some` while `drawing && shift_held`
     /// (and set at press time), `None` in freehand mode.
     rect_start: Option<(f32, f32)>,
@@ -132,6 +152,10 @@ struct AppState {
     icons: IconCache,
     apps_rx: Option<Receiver<Vec<App>>>,
     last_card: Option<picker::CardRect>,
+
+    /// Timestamp the shimmer animation uses as phase zero. Reset when a new
+    /// stroke begins so the pulse always starts at the beginning of the line.
+    stroke_anim_start: Instant,
 
     /// Reset on every typing event so the caret stays solid for one half-cycle
     /// after input (matches standard text-input UX).
@@ -218,6 +242,18 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         })
         .map_err(|e| anyhow::anyhow!("inserting blink timer: {e}"))?;
 
+    // Shimmer tick: while a stroke is being drawn, the gradient pulse along
+    // the line needs ~30 fps to feel continuous. Dirty only when there's
+    // something to animate so the wakeup cost is near-zero on an idle overlay.
+    loop_handle
+        .insert_source(Timer::from_duration(SHIMMER_TICK), |_, _, state: &mut AppState| {
+            if state.phase == Phase::Drawing && state.stroke.points().len() >= 2 {
+                state.needs_redraw = true;
+            }
+            TimeoutAction::ToDuration(SHIMMER_TICK)
+        })
+        .map_err(|e| anyhow::anyhow!("inserting shimmer timer: {e}"))?;
+
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -244,6 +280,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         has_drawn: false,
         stroke: Stroke::new(),
         shift_held: false,
+        ctrl_held: false,
         rect_start: None,
 
         phase: Phase::Drawing,
@@ -254,6 +291,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         apps_rx,
         last_card: None,
 
+        stroke_anim_start: Instant::now(),
         caret_blink_reset: Instant::now(),
         caret_last_visible: true,
         pixmap: None,
@@ -402,6 +440,15 @@ impl AppState {
             return;
         }
 
+        // Ctrl+P toggles the pinned "default" app on the selected row.
+        // Short-circuit before the text-input branch so the control char
+        // (0x10) doesn't land in the search query.
+        if self.ctrl_held && matches!(event.keysym, Keysym::p | Keysym::P) {
+            self.picker.toggle_pin_selected();
+            self.needs_redraw = true;
+            return;
+        }
+
         match event.keysym {
             Keysym::Return | Keysym::KP_Enter => {
                 self.finalize_spawn();
@@ -483,11 +530,23 @@ impl AppState {
             Phase::Drawing => STROKE_COLOR.3,
             Phase::Picking => STROKE_DIM_ALPHA,
         };
-        draw_stroke(pixmap, &self.stroke, stroke_alpha, scale);
+        let shimmer_on = self.phase == Phase::Drawing;
+        let anim_t = self.stroke_anim_start.elapsed().as_secs_f32();
+        draw_stroke(pixmap, &self.stroke, stroke_alpha, scale, anim_t, shimmer_on);
 
         if self.phase == Phase::Drawing && !self.drawing && !self.has_drawn {
             if let Some((cx, cy)) = self.cursor {
                 draw_crosshair(pixmap, cx, cy, scale);
+            }
+        }
+
+        // Default-mode hint: tells the user which app this bind launches and
+        // how to escape to the picker. Without it, a user who pinned by
+        // accident has no way to discover the secondary bind.
+        if self.phase == Phase::Drawing {
+            if let Some(preset) = self.preset_exec.clone() {
+                let display = preset.split_whitespace().next().unwrap_or(&preset).to_string();
+                draw_default_banner(pixmap, &mut self.text, w_log, &display, scale);
             }
         }
 
@@ -507,6 +566,18 @@ impl AppState {
                 }
                 card.item_at(cy as i32, self.picker.visible_count())
             });
+            // Forget-button hover: only valid on history rows, since the × is
+            // hidden for non-history rows. We resolve to the absolute index
+            // first (rel + scroll_offset) to ask the picker.
+            let forget_hover_rel = self.last_card.and_then(|card| {
+                let (cx, cy) = self.cursor?;
+                let rel = card.item_at(cy as i32, self.picker.visible_count())?;
+                if !card.forget_button_hit(cx as i32, cy as i32) {
+                    return None;
+                }
+                let abs = self.picker.scroll_offset() + rel;
+                self.picker.is_history_row(abs).then_some(rel)
+            });
             let card = picker::draw(
                 pixmap,
                 &self.picker,
@@ -516,6 +587,7 @@ impl AppState {
                 (w_log, h_log),
                 caret_visible,
                 hovered_rel,
+                forget_hover_rel,
                 scale,
             );
             self.last_card = Some(card);
@@ -553,28 +625,270 @@ fn push_corner_arc(stroke: &mut Stroke, cx: f32, cy: f32, r: f32, start_deg: f32
     }
 }
 
-fn draw_stroke(pixmap: &mut Pixmap, stroke: &Stroke, alpha: u8, scale: u32) {
+fn draw_stroke(
+    pixmap: &mut Pixmap,
+    stroke: &Stroke,
+    alpha: u8,
+    scale: u32,
+    anim_t: f32,
+    shimmer: bool,
+) {
     let pts = stroke.points();
     if pts.len() < 2 {
         return;
     }
-    let mut pb = PathBuilder::new();
-    pb.move_to(pts[0].x, pts[0].y);
-    for p in &pts[1..] {
-        pb.line_to(p.x, p.y);
-    }
-    let Some(path) = pb.finish() else { return };
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(STROKE_COLOR.0, STROKE_COLOR.1, STROKE_COLOR.2, alpha);
-    paint.anti_alias = true;
     let s = scale as f32;
-    let sk = SkStroke {
+    let transform = Transform::from_scale(s, s);
+    let sk_round = SkStroke {
         width: STROKE_WIDTH * s,
         line_cap: tiny_skia::LineCap::Round,
         line_join: tiny_skia::LineJoin::Round,
         ..Default::default()
     };
-    pixmap.stroke_path(&path, &paint, &sk, Transform::from_scale(s, s), None);
+
+    // Pass 1: the stroke as ONE continuous subpath in the base color. This
+    // preserves `line_join: Round` across every vertex, so rectangular corners
+    // and freehand curves alike stay seamless — no segmentation artifacts.
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts[0].x, pts[0].y);
+    for p in &pts[1..] {
+        pb.line_to(p.x, p.y);
+    }
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(STROKE_COLOR.0, STROKE_COLOR.1, STROKE_COLOR.2, alpha);
+        paint.anti_alias = true;
+        pixmap.stroke_path(&path, &paint, &sk_round, transform, None);
+    }
+
+    if !shimmer {
+        return;
+    }
+
+    // Pass 2: a bright highlight painted on top of the stroke in the region
+    // near the pulse. Drawn as layered "bands" of increasing width + softer
+    // alpha to approximate a Gaussian halo without per-segment color steps.
+    //
+    // Freehand strokes naturally have dense, short segments, but rect-mode
+    // strokes encode the 4 sides as *single* long segments between arcs. To
+    // give the halo the same resolution on any shape, we resample the
+    // polyline into ≤ MAX_SEG-long pieces before computing band inclusion.
+    const MAX_SEG: f32 = 2.0;
+    let mut dense: Vec<(f32, f32)> = Vec::with_capacity(pts.len() * 2);
+    dense.push((pts[0].x, pts[0].y));
+    for i in 1..pts.len() {
+        let (x0, y0) = (pts[i - 1].x, pts[i - 1].y);
+        let (x1, y1) = (pts[i].x, pts[i].y);
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= MAX_SEG {
+            dense.push((x1, y1));
+        } else {
+            let n = (len / MAX_SEG).ceil().max(1.0) as usize;
+            for k in 1..=n {
+                let t = k as f32 / n as f32;
+                dense.push((x0 + dx * t, y0 + dy * t));
+            }
+        }
+    }
+
+    let mut cum_dist = vec![0.0_f32; dense.len()];
+    for i in 1..dense.len() {
+        let dx = dense[i].0 - dense[i - 1].0;
+        let dy = dense[i].1 - dense[i - 1].1;
+        cum_dist[i] = cum_dist[i - 1] + (dx * dx + dy * dy).sqrt();
+    }
+    let total = cum_dist[dense.len() - 1].max(1.0);
+
+    // If the stroke's endpoints coincide (rectangle mode always closes the
+    // path), treat it as cyclic so the pulse wraps continuously instead of
+    // disappearing past the end and re-appearing at the start. We tile three
+    // copies of the polyline end-to-end and put the pulse into the *middle*
+    // copy. A single halo with half-width up to `sigma * width_max * total`
+    // then always has enough slack on both sides to render without clipping,
+    // regardless of where in the cycle the pulse sits — no more "half pulse"
+    // flash at the seam.
+    let (dx_end, dy_end) = (
+        dense[dense.len() - 1].0 - dense[0].0,
+        dense[dense.len() - 1].1 - dense[0].1,
+    );
+    let closed = (dx_end * dx_end + dy_end * dy_end).sqrt() < 2.0;
+    let (eff_dense, eff_cum) = if closed {
+        let mut d = dense.clone();
+        let mut c = cum_dist.clone();
+        for copy in 1..=2 {
+            let offset = copy as f32 * total;
+            for i in 1..dense.len() {
+                d.push(dense[i]);
+                c.push(cum_dist[i] + offset);
+            }
+        }
+        (d, c)
+    } else {
+        (dense, cum_dist)
+    };
+
+    let sigma: f32 = 0.14; // half-width of the pulse in normalized-length units
+
+    // Two pulses 180° out of phase, each in its own hue. As they cross the
+    // mid of the stroke their bleed mixes into a momentary white-hot spot —
+    // that's the synthwave "chromatic crossover" we want.
+    const NUM_PULSES: usize = 2;
+    const N_BANDS: usize = 10;
+
+    let base_cycle = (anim_t % SHIMMER_CYCLE_S) / SHIMMER_CYCLE_S;
+
+    for p in 0..NUM_PULSES {
+        let (pulse_r, pulse_g, pulse_b) = PULSE_COLORS[p % PULSE_COLORS.len()];
+        let pulse_norm = (base_cycle + p as f32 / NUM_PULSES as f32) % 1.0;
+        let pulse_dist = if closed {
+            total + pulse_norm * total
+        } else {
+            (pulse_norm * (1.0 + 2.0 * sigma) - sigma) * total
+        };
+
+        // For open strokes, cross-fade each pulse near the endpoints using a
+        // smoothstep so it enters/exits gently instead of appearing at full
+        // brightness with its round cap at the first/last pixel.
+        let edge_falloff = if closed {
+            1.0
+        } else {
+            let e_in = (pulse_norm / 0.12).clamp(0.0, 1.0);
+            let e_out = ((1.0 - pulse_norm) / 0.12).clamp(0.0, 1.0);
+            let t = e_in.min(e_out);
+            t * t * (3.0 - 2.0 * t) // smoothstep
+        };
+        if edge_falloff < 0.02 {
+            continue;
+        }
+
+        for k in 0..N_BANDS {
+            let t = k as f32 / (N_BANDS as f32 - 1.0);
+            let width_mult = 2.2 - 1.9 * t;
+            // Per-band alpha — outer halo softer, core bright. With two
+            // hue-distinct pulses overlaying, total alpha stays visually
+            // balanced without saturating the eye.
+            let raw_alpha = (18.0 + 22.0 * t) * edge_falloff;
+            let alpha = raw_alpha.clamp(0.0, 255.0) as u8;
+            // Mix the pulse hue toward white at the core — keeps color in
+            // the halo and lets the bright crest read as a heat-flash.
+            let mix = t * 0.7;
+            let cr = (pulse_r as f32 + (255.0 - pulse_r as f32) * mix) as u8;
+            let cg = (pulse_g as f32 + (255.0 - pulse_g as f32) * mix) as u8;
+            let cb = (pulse_b as f32 + (255.0 - pulse_b as f32) * mix) as u8;
+
+            // Outer bands get a wider stroke so the halo "bleeds" outside
+            // the line — that's the neon-tube glow. Core stays close to the
+            // base width for a sharp crest.
+            let band_w = STROKE_WIDTH * (0.85 + (1.0 - t) * 1.6);
+            let sk_band = SkStroke {
+                width: band_w * s,
+                line_cap: tiny_skia::LineCap::Round,
+                line_join: tiny_skia::LineJoin::Round,
+                ..Default::default()
+            };
+
+            let half = sigma * width_mult * total;
+            let lo = pulse_dist - half;
+            let hi = pulse_dist + half;
+
+            let mut pb = PathBuilder::new();
+            let mut active = false;
+            let mut any = false;
+            for i in 1..eff_dense.len() {
+                let mid = (eff_cum[i - 1] + eff_cum[i]) * 0.5;
+                if mid >= lo && mid <= hi {
+                    if !active {
+                        pb.move_to(eff_dense[i - 1].0, eff_dense[i - 1].1);
+                        active = true;
+                        any = true;
+                    }
+                    pb.line_to(eff_dense[i].0, eff_dense[i].1);
+                } else {
+                    active = false;
+                }
+            }
+            if !any {
+                continue;
+            }
+            let Some(path) = pb.finish() else { continue };
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(cr, cg, cb, alpha);
+            paint.anti_alias = true;
+            pixmap.stroke_path(&path, &paint, &sk_band, transform, None);
+        }
+    }
+}
+
+/// Translucent pill at the top of the overlay shown only in `--default` mode.
+/// Tells the user which app this bind will launch and how to switch to the
+/// picker without already knowing the secondary keybind. Ensures the pinning
+/// feature is escapable from a single-bind user's perspective.
+fn draw_default_banner(
+    pixmap: &mut Pixmap,
+    text: &mut TextRenderer,
+    overlay_w: u32,
+    preset: &str,
+    scale: u32,
+) {
+    let s = scale as f32;
+    let s_i = scale as i32;
+    let t = Transform::from_scale(s, s);
+
+    let font_size = 13.0_f32;
+    let body = format!("★ {preset}   ·   Hold CTRL to pick another");
+    let text_w_phys = text.measure_width_weighted(&body, font_size * s, Weight::MEDIUM);
+    let text_w_log = (text_w_phys / s).ceil() as i32;
+
+    let banner_h = 32;
+    let pad_x = 16;
+    let banner_w = text_w_log + 2 * pad_x;
+    let banner_x = (overlay_w as i32 - banner_w) / 2;
+    // Sits below most top bars (~63 px on common Quickshell setups). If a
+    // user has a thicker bar the banner gets clipped — but at 80 px it's
+    // still visible to the vast majority and doesn't compete with the
+    // typical "draw in the middle of the screen" gesture.
+    let banner_y = 80;
+
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(20, 21, 30, 230);
+    bg.anti_alias = true;
+    if let Some(path) = pill_path(banner_x as f32, banner_y as f32, banner_w as f32, banner_h as f32, 16.0) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
+        let mut border = Paint::default();
+        border.set_color_rgba8(170, 100, 255, 130);
+        border.anti_alias = true;
+        let stroke = SkStroke { width: 1.0, ..Default::default() };
+        pixmap.stroke_path(&path, &border, &stroke, t, None);
+    }
+
+    let text_y = banner_y + (banner_h - font_size as i32) / 2 - 1;
+    text.draw_weighted(
+        pixmap,
+        (banner_x + pad_x) * s_i,
+        text_y * s_i,
+        &body,
+        font_size * s,
+        text_w_phys + 2.0 * s,
+        (235, 230, 245, 255),
+        Weight::MEDIUM,
+    );
+}
+
+fn pill_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.quad_to(x + w, y, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.quad_to(x + w, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.quad_to(x, y + h, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.quad_to(x, y, x + r, y);
+    pb.close();
+    pb.finish()
 }
 
 fn draw_crosshair(pixmap: &mut Pixmap, x: f32, y: f32, scale: u32) {
@@ -748,6 +1062,9 @@ impl PointerHandler for AppState {
                         let (x, y) = ev.position;
                         let (xf, yf) = (x as f32, y as f32);
                         self.stroke.clear();
+                        // Restart the shimmer phase so the pulse begins at the
+                        // stroke origin every time the user picks up the pen.
+                        self.stroke_anim_start = Instant::now();
                         if self.shift_held {
                             self.rect_start = Some((xf, yf));
                             self.update_rect_stroke(xf, yf);
@@ -794,6 +1111,27 @@ impl PointerHandler for AppState {
                     if self.phase == Phase::Drawing && button == BTN_LEFT && self.drawing {
                         self.drawing = false;
                         self.rect_start = None;
+                        // Live-escape from --default: if the user was holding
+                        // Ctrl while drawing, they want the picker for this
+                        // spawn instead of the pinned app. Clearing the
+                        // preset makes enter_picker_phase fall through to the
+                        // picker instead of spawning directly. We use Ctrl
+                        // (not Shift) because Shift is already overloaded for
+                        // rectangle-mode drawing — sharing it would silently
+                        // cancel the pinned app every time the user drew a
+                        // rectangle.
+                        //
+                        // The apps list wasn't preloaded (we skipped the
+                        // background scan assuming we wouldn't need it), so
+                        // kick it off here; the picker will show "Loading…"
+                        // briefly until the scan finishes.
+                        if self.ctrl_held && self.preset_exec.is_some() {
+                            self.preset_exec = None;
+                            if self.apps_rx.is_none() {
+                                let (rx, _) = apps::discover_async();
+                                self.apps_rx = Some(rx);
+                            }
+                        }
                         self.enter_picker_phase();
                     }
                 }
@@ -874,6 +1212,7 @@ impl KeyboardHandler for AppState {
         _: u32,
     ) {
         self.shift_held = modifiers.shift;
+        self.ctrl_held = modifiers.ctrl;
         // If the user pressed/released Shift mid-drag, snap the stroke to
         // the corresponding mode immediately.
         if self.phase == Phase::Drawing && self.drawing {

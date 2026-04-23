@@ -9,9 +9,11 @@ mod history;
 mod hyprland;
 mod overlay;
 mod picker;
+mod pinned;
 mod stroke;
 
 use history::History;
+use pinned::Pinned;
 
 #[derive(Parser)]
 #[command(name = "spawnhere", version, about = "Draw a gesture to spawn a floating window")]
@@ -25,6 +27,11 @@ struct Cli {
     /// then `kitty`). Draws the gesture, skips the picker, spawns a terminal.
     #[arg(long, short = 't')]
     term: bool,
+
+    /// Spawn the pinned "default" app directly (skips the picker). Pin/unpin
+    /// from the picker with P. Falls back to the picker if no app is pinned.
+    #[arg(long, short = 'd', conflicts_with_all = ["spawn", "term"])]
+    default: bool,
 
     /// Extra pixels added to the bbox on each side (0 = exact stroke fidelity).
     #[arg(long, default_value_t = 0)]
@@ -47,6 +54,10 @@ fn main() -> Result<()> {
 
     let preset_exec = if cli.term {
         Some(config::resolve_terminal(&cfg))
+    } else if cli.default {
+        // If nothing is pinned, fall through to the picker so the user can
+        // choose and then press P to pin — that's the natural first-run flow.
+        Pinned::load().exec().map(String::from)
     } else {
         cli.spawn.clone()
     };
