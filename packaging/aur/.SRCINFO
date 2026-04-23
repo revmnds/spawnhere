@@ -1,8 +1,8 @@
-pkgbase = magicwand
+pkgbase = spawnhere
 	pkgdesc = Draw a gesture on Hyprland, spawn a floating window exactly where you drew
 	pkgver = 0.1.0
 	pkgrel = 1
-	url = https://github.com/yourname/magicwand
+	url = https://github.com/yourname/spawnhere
 	arch = x86_64
 	license = MIT
 	makedepends = cargo
@@ -12,7 +12,7 @@ pkgbase = magicwand
 	depends = libxkbcommon
 	depends = fontconfig
 	depends = freetype2
-	source = magicwand-0.1.0.tar.gz::https://github.com/yourname/magicwand/archive/refs/tags/v0.1.0.tar.gz
+	source = spawnhere-0.1.0.tar.gz::https://github.com/yourname/spawnhere/archive/refs/tags/v0.1.0.tar.gz
 	sha256sums = SKIP
 
-pkgname = magicwand
+pkgname = spawnhere
