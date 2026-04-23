@@ -318,20 +318,36 @@ impl AppState {
         }
     }
 
-    /// Replace the current stroke with the 5 corner points of an axis-aligned
-    /// rectangle from `rect_start` to `(cx, cy)`. The stroke renderer draws a
-    /// polyline, so closing the path (returning to the start) yields a clean
-    /// rectangle outline matching freehand visual style.
+    /// Replace the current stroke with a rounded-rectangle outline from
+    /// `rect_start` to `(cx, cy)`. The stroke renderer draws a polyline, so
+    /// each 90° corner is tesselated into a few short segments and the
+    /// straight edges fall out as the connecting `line_to`s between arc
+    /// endpoints. The radius is subtle (8 logical px) and clamps to half the
+    /// smaller side so tiny rects don't become circles.
     fn update_rect_stroke(&mut self, cx: f32, cy: f32) {
         let Some((sx, sy)) = self.rect_start else { return };
         self.stroke.clear();
         let (x0, x1) = (sx.min(cx), sx.max(cx));
         let (y0, y1) = (sy.min(cy), sy.max(cy));
-        self.stroke.push(x0, y0);
-        self.stroke.push(x1, y0);
-        self.stroke.push(x1, y1);
-        self.stroke.push(x0, y1);
-        self.stroke.push(x0, y0);
+        let w = x1 - x0;
+        let h = y1 - y0;
+        let r = 8.0_f32.min(w * 0.5).min(h * 0.5);
+        if r < 1.0 {
+            // Too small to round — fall back to the sharp 5-point rectangle.
+            self.stroke.push(x0, y0);
+            self.stroke.push(x1, y0);
+            self.stroke.push(x1, y1);
+            self.stroke.push(x0, y1);
+            self.stroke.push(x0, y0);
+            return;
+        }
+        push_corner_arc(&mut self.stroke, x1 - r, y0 + r, r, 270.0, 360.0); // top-right
+        push_corner_arc(&mut self.stroke, x1 - r, y1 - r, r, 0.0,   90.0);  // bottom-right
+        push_corner_arc(&mut self.stroke, x0 + r, y1 - r, r, 90.0,  180.0); // bottom-left
+        push_corner_arc(&mut self.stroke, x0 + r, y0 + r, r, 180.0, 270.0); // top-left
+        // Close: back to the start of the top-right arc so the top edge
+        // renders as the final line_to segment.
+        self.stroke.push(x1 - r, y0);
     }
 
     fn enter_picker_phase(&mut self) {
@@ -524,6 +540,18 @@ impl AppState {
         surface.frame(qh, surface.clone());
         surface.commit();
         Ok(())
+    }
+}
+
+/// Tesselate a quarter-circle arc into short line segments and push each
+/// point onto the stroke. The stroke renderer draws line segments between
+/// consecutive points, so N segments = N+1 points on the arc.
+fn push_corner_arc(stroke: &mut Stroke, cx: f32, cy: f32, r: f32, start_deg: f32, end_deg: f32) {
+    const SEGS: u32 = 6;
+    for i in 0..=SEGS {
+        let t = i as f32 / SEGS as f32;
+        let theta = (start_deg + t * (end_deg - start_deg)).to_radians();
+        stroke.push(cx + r * theta.cos(), cy + r * theta.sin());
     }
 }
 
