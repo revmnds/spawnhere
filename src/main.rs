@@ -68,16 +68,14 @@ fn main() -> Result<()> {
     })
     .context("overlay failed")?;
 
-    let (bbox, exec, output_rect) = match outcome {
-        overlay::Outcome::Spawn { bbox, exec, output_rect } => (bbox, exec, output_rect),
+    let (bbox, exec, screen) = match outcome {
+        overlay::Outcome::Spawn { bbox, exec, screen } => (bbox, exec, screen),
         overlay::Outcome::Cancelled => return Ok(()),
     };
 
-    // Re-clamp after the per-app rule in case `min_width`/`min_height` grew
-    // the box back over an edge. `output_rect` is the monitor the bbox center
-    // landed on, in global compositor coords — clamping to it keeps the
-    // window on that specific monitor rather than spilling onto a neighbor.
-    let bbox = config::apply_rule(bbox, cfg.rule_for(&exec)).clamp_to_rect(output_rect);
+    // Re-clamp after per-app rule expansions: `rules.X.min_width` can grow
+    // the box back over an edge. `screen` is the overlay's rect.
+    let bbox = config::apply_rule(bbox, cfg.rule_for(&exec)).clamp_to_rect(screen);
     hyprland::spawn_floating(&exec, bbox)?;
     History::record(&exec);
     Ok(())

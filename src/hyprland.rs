@@ -1,8 +1,5 @@
 //! Hyprland IPC adapter — spawns a floating window at a given bbox via
 //! `hyprctl dispatch exec` with a dispatch prefix.
-//!
-//! This is the only compositor magicwand targets, so it lives as a plain
-//! function instead of behind a trait.
 
 use crate::stroke::Bbox;
 use anyhow::{bail, Context, Result};
@@ -22,6 +19,10 @@ pub fn ensure_running() -> Result<()> {
     Ok(())
 }
 
+/// Spawn a floating window via `hyprctl dispatch exec` with inline window
+/// rules. `bbox` is in monitor-local coords (matches Hyprland's `move X Y`
+/// window rule semantics); Hyprland places the new window on the active
+/// monitor's current workspace, which is the same monitor our overlay was on.
 pub fn spawn_floating(cmd: &str, bbox: Bbox) -> Result<()> {
     let payload = format!(
         "[float;move {} {};size {} {}] {}",

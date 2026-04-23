@@ -106,17 +106,11 @@ Every spawn appends the exec to `~/.local/share/magicwand/history`. When the que
 
 ## Multi-monitor
 
-The bind covers **every** attached output. Each monitor gets its own layer-shell surface; strokes and the final bbox live in a single global coordinate frame so:
-
-- You can press the bind on any monitor and start drawing.
-- You can drag a stroke across the bezel — it renders continuously on both sides.
-- The spawned window lands on whichever monitor contains the bbox center (and is clamped to that monitor so it never bleeds onto a neighbor).
-
-Outputs added or removed mid-gesture are handled (new overlays appear the next frame; a removed monitor's overlay is torn down without cancelling the gesture unless it was the last one).
+The overlay appears on whichever monitor Hyprland decides is "active" when the bind fires (typically the one with focus). Drawing happens on that monitor; the spawned window lands on the same one. To use magicwand on another monitor, focus it first (hover or keyboard-switch) and then press the bind.
 
 ## HiDPI
 
-Per-monitor scale is honored via `scale_factor_changed` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density on each output; icons are rasterized at `24 × scale` with one cache per distinct scale, so a 1× + 2× setup stays sharp on both without duplicate work.
+The overlay honors the compositor's advertised scale factor via `scale_factor_changed` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density; icons are rasterized at `24 × scale` pixels.
 
 ## License
 

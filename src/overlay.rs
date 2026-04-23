@@ -3,7 +3,6 @@ use crate::history::History;
 use crate::picker::{self, PickerState, TextRenderer};
 use crate::stroke::{Bbox, Stroke};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -36,8 +35,8 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
 use wayland_client::Proxy;
+use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
@@ -46,11 +45,11 @@ use wayland_client::{
 
 pub enum Outcome {
     /// User completed a gesture and (if no preset `--spawn`) chose an app.
-    /// `bbox` is post-padding + min-size enforcement in **global** compositor
-    /// coords (i.e. the coordinate space Hyprland's `[move X Y]` dispatch
-    /// expects). `output_rect` is the monitor rect the window will land on —
-    /// the caller should clamp to this after applying per-app rule expansions.
-    Spawn { bbox: Bbox, exec: String, output_rect: Bbox },
+    /// `bbox` is post-padding + min-size enforcement, in the overlay's
+    /// surface-local coord frame (== monitor-local for a fullscreen layer
+    /// surface on a single output). `screen` is the overlay's rect, handed
+    /// back so the caller can re-clamp after applying per-app rule expansions.
+    Spawn { bbox: Bbox, exec: String, screen: Bbox },
     Cancelled,
 }
 
@@ -90,58 +89,22 @@ enum Phase {
     Picking,
 }
 
-/// One overlay per monitor. Each owns its own surface, pixmap, and scale.
-/// Strokes + bboxes live in a single global coord frame (the compositor's
-/// logical coordinate space); each overlay translates to its local frame at
-/// render time via `origin`.
-struct OutputOverlay {
-    output: wl_output::WlOutput,
-    surface: LayerSurface,
-    /// Top-left in the compositor's global logical coord space. `(0, 0)` is a
-    /// sane default for single-monitor setups where Hyprland doesn't emit a
-    /// logical-position event until layout settles.
-    origin: (i32, i32),
-    /// Surface size in **logical** pixels (== this output's logical size for
-    /// fullscreen layer surfaces).
-    width: u32,
-    height: u32,
-    scale: i32,
-    configured: bool,
-    /// Reused across frames — reallocated only when physical dims change.
-    pixmap: Option<Pixmap>,
-}
-
-impl OutputOverlay {
-    fn rect(&self) -> Bbox {
-        Bbox {
-            x: self.origin.0,
-            y: self.origin.1,
-            w: self.width,
-            h: self.height,
-        }
-    }
-
-    fn contains_global(&self, gx: i32, gy: i32) -> bool {
-        self.rect().contains_point(gx, gy)
-    }
-}
-
 struct AppState {
     registry_state: RegistryState,
     output_state: OutputState,
     shm: Shm,
     seat_state: SeatState,
-    compositor_state: CompositorState,
-    layer_shell: LayerShell,
 
     pool: SlotPool,
-    /// One overlay per attached output. Populated via `OutputHandler::new_output`
-    /// and torn down via `output_destroyed`.
-    overlays: Vec<OutputOverlay>,
-    /// Per-scale icon caches so a 1× + 2× mixed setup stays sharp on both
-    /// without duplicate rasterization work.
-    icon_caches: HashMap<i32, IconCache>,
+    layer: LayerSurface,
 
+    width: u32,
+    height: u32,
+    /// Compositor-advertised output scale (1 for standard, 2 for HiDPI, etc.).
+    /// Updated via `scale_factor_changed`; drives physical-pixel allocation
+    /// and buffer scaling so the UI renders sharp on 2×/3× displays.
+    scale: i32,
+    configured: bool,
     needs_redraw: bool,
 
     pointer: Option<wl_pointer::WlPointer>,
@@ -152,29 +115,24 @@ struct AppState {
     cursor_shape_manager: CursorShapeManager,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
 
-    /// Cursor position in GLOBAL compositor logical coords. `None` when the
-    /// pointer is outside all of our overlays (not physically possible on a
-    /// fully-covered desktop, but can happen briefly during output hotplug).
-    cursor_global: Option<(f32, f32)>,
+    cursor: Option<(f32, f32)>,
     drawing: bool,
     has_drawn: bool,
-    /// Stroke points are stored in **global** coords. Each overlay subtracts
-    /// its `origin` at render time to draw its slice.
     stroke: Stroke,
     /// Live shift-modifier state. When true during the press/drag, the stroke
     /// is replaced with a clean rectangle from press point to current cursor
     /// instead of capturing freehand points.
     shift_held: bool,
-    /// Press-point of a rectangle drag, in global coords. `Some` while
-    /// `drawing && shift_held`, `None` in freehand mode.
+    /// Press-point of a rectangle drag. `Some` while `drawing && shift_held`
+    /// (and set at press time), `None` in freehand mode.
     rect_start: Option<(f32, f32)>,
 
     phase: Phase,
     preset_exec: Option<String>,
     picker: PickerState,
     text: TextRenderer,
+    icons: IconCache,
     apps_rx: Option<Receiver<Vec<App>>>,
-    /// Picker card's position in GLOBAL coords.
     last_card: Option<picker::CardRect>,
 
     /// Reset on every typing event so the caret stays solid for one half-cycle
@@ -183,6 +141,10 @@ struct AppState {
     /// Last caret visibility we committed to the screen. Used to suppress
     /// redraws on blink ticks when nothing actually changed.
     caret_last_visible: bool,
+
+    /// Reused across frames — reallocated only when the surface size changes.
+    /// Avoids a full-screen malloc/free per draw call.
+    pixmap: Option<Pixmap>,
 
     decision: Decision,
     loop_handle: LoopHandle<'static, AppState>,
@@ -206,6 +168,15 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
     )?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
+    let surface = compositor_state.create_surface(&qh);
+    let layer =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("magicwand"), None);
+    layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+    layer.set_exclusive_zone(-1);
+    layer.set_size(0, 0);
+    layer.commit();
+
     // Hyprland always exposes `wp_cursor_shape_v1`; bail hard if missing so
     // we fail loudly rather than silently falling back to a hidden cursor.
     let cursor_shape_manager = CursorShapeManager::bind(&globals, &qh).context(
@@ -213,8 +184,8 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
          build — please update Hyprland (0.34+ recommended).",
     )?;
 
-    // SlotPool grows on demand. Start with 1080p @ 2× so a typical HiDPI
-    // laptop overlay doesn't need to grow on first frame.
+    // Initial pool is a hint, not a cap — SlotPool grows on demand. Start
+    // with 1080p @ 2× so typical HiDPI laptops don't need to grow on first use.
     let pool = SlotPool::new(1920 * 1080 * 4 * 2, &shm).context("creating shm pool")?;
 
     // Kick off background app discovery only if we'll need the picker.
@@ -254,13 +225,14 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         output_state: OutputState::new(&globals, &qh),
         shm,
         seat_state: SeatState::new(&globals, &qh),
-        compositor_state,
-        layer_shell,
 
         pool,
-        overlays: Vec::new(),
-        icon_caches: HashMap::new(),
+        layer,
 
+        width: 0,
+        height: 0,
+        scale: 1,
+        configured: false,
         needs_redraw: false,
 
         pointer: None,
@@ -269,7 +241,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         cursor_shape_manager,
         cursor_shape_device: None,
 
-        cursor_global: None,
+        cursor: None,
         drawing: false,
         has_drawn: false,
         stroke: Stroke::new(),
@@ -280,11 +252,13 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         preset_exec,
         picker: PickerState::new(history),
         text: TextRenderer::new(),
+        icons: IconCache::new(24),
         apps_rx,
         last_card: None,
 
         caret_blink_reset: Instant::now(),
         caret_last_visible: true,
+        pixmap: None,
 
         decision: Decision::Pending,
         loop_handle,
@@ -293,6 +267,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
 
     event_loop
         .run(Duration::from_millis(16), &mut state, |state| {
+            // Drain background app scan.
             if state.picker.loading() {
                 if let Some(rx) = &state.apps_rx {
                     if let Ok(apps) = rx.try_recv() {
@@ -302,8 +277,8 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
                 }
             }
 
-            if state.needs_redraw && state.any_configured() {
-                if let Err(e) = state.draw_all(&qh) {
+            if state.configured && state.needs_redraw {
+                if let Err(e) = state.draw(&qh) {
                     eprintln!("magicwand: draw failed: {e:#}");
                 }
                 state.needs_redraw = false;
@@ -315,26 +290,17 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         })
         .context("running calloop event loop")?;
 
-    // Union of all output rects — used if we somehow can't resolve a specific
-    // output for the gesture (shouldn't happen, but we never want to spawn at
-    // 0×0).
-    let desktop = state.desktop_rect();
+    let screen = Bbox { x: 0, y: 0, w: state.width, h: state.height };
     let stroke = std::mem::take(&mut state.stroke);
     Ok(match std::mem::replace(&mut state.decision, Decision::Cancel) {
         Decision::Spawn(exec) => {
             let raw = stroke.bbox(padding);
             if raw.w == 0 && raw.h == 0 {
+                // Click without drag — treat as cancel rather than spawn at 0×0.
                 Outcome::Cancelled
             } else {
-                let enforced = raw.enforce_min(min_width, min_height);
-                let cx = enforced.x + enforced.w as i32 / 2;
-                let cy = enforced.y + enforced.h as i32 / 2;
-                let output_rect = state
-                    .overlay_containing_global(cx, cy)
-                    .map(|i| state.overlays[i].rect())
-                    .unwrap_or(desktop);
-                let bbox = enforced.clamp_to_rect(output_rect);
-                Outcome::Spawn { bbox, exec, output_rect }
+                let bbox = raw.enforce_min(min_width, min_height).clamp_to_rect(screen);
+                Outcome::Spawn { bbox, exec, screen }
             }
         }
         _ => Outcome::Cancelled,
@@ -342,59 +308,6 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
 }
 
 impl AppState {
-    fn any_configured(&self) -> bool {
-        self.overlays.iter().any(|o| o.configured)
-    }
-
-    fn desktop_rect(&self) -> Bbox {
-        let mut it = self.overlays.iter().filter(|o| o.configured);
-        let Some(first) = it.next() else {
-            return Bbox { x: 0, y: 0, w: 1, h: 1 };
-        };
-        let mut min_x = first.origin.0;
-        let mut min_y = first.origin.1;
-        let mut max_x = first.origin.0 + first.width as i32;
-        let mut max_y = first.origin.1 + first.height as i32;
-        for o in it {
-            min_x = min_x.min(o.origin.0);
-            min_y = min_y.min(o.origin.1);
-            max_x = max_x.max(o.origin.0 + o.width as i32);
-            max_y = max_y.max(o.origin.1 + o.height as i32);
-        }
-        Bbox {
-            x: min_x,
-            y: min_y,
-            w: (max_x - min_x).max(1) as u32,
-            h: (max_y - min_y).max(1) as u32,
-        }
-    }
-
-    fn overlay_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
-        self.overlays
-            .iter()
-            .position(|o| o.surface.wl_surface().id() == surface.id())
-    }
-
-    fn overlay_for_layer(&self, layer: &LayerSurface) -> Option<usize> {
-        self.overlays
-            .iter()
-            .position(|o| o.surface.wl_surface().id() == layer.wl_surface().id())
-    }
-
-    fn overlay_containing_global(&self, gx: i32, gy: i32) -> Option<usize> {
-        self.overlays
-            .iter()
-            .position(|o| o.configured && o.contains_global(gx, gy))
-    }
-
-    /// Lazily create an IconCache for the given scale. All overlays on that
-    /// scale share the cache.
-    fn ensure_icon_cache(&mut self, scale: i32) {
-        self.icon_caches
-            .entry(scale)
-            .or_insert_with(|| IconCache::new(24 * scale.max(1) as u32));
-    }
-
     fn finalize_spawn(&mut self) {
         if let Some(app) = self.picker.selected_app() {
             self.decision = Decision::Spawn(app.exec.clone());
@@ -406,7 +319,9 @@ impl AppState {
     }
 
     /// Replace the current stroke with the 5 corner points of an axis-aligned
-    /// rectangle from `rect_start` to `(cx, cy)`. Points are in global coords.
+    /// rectangle from `rect_start` to `(cx, cy)`. The stroke renderer draws a
+    /// polyline, so closing the path (returning to the start) yields a clean
+    /// rectangle outline matching freehand visual style.
     fn update_rect_stroke(&mut self, cx: f32, cy: f32) {
         let Some((sx, sy)) = self.rect_start else { return };
         self.stroke.clear();
@@ -421,17 +336,25 @@ impl AppState {
 
     fn enter_picker_phase(&mut self) {
         if let Some(exec) = &self.preset_exec {
+            // No picker — spawn directly with the preset exec.
             self.decision = Decision::Spawn(exec.clone());
             return;
         }
         self.phase = Phase::Picking;
         self.caret_blink_reset = Instant::now();
+        // Re-show the cursor now that we're out of the drawing phase. If the
+        // pointer isn't currently over our surface, this is a no-op until the
+        // next Enter — which will hit the phase-aware branch below.
         self.refresh_cursor();
         self.needs_redraw = true;
     }
 
+    /// Apply the cursor appropriate to the current phase, using the most recent
+    /// enter serial tracked by SCTK. Safe to call whenever phase changes.
     fn refresh_cursor(&self) {
-        let Some(pointer) = self.pointer.as_ref() else { return };
+        let Some(pointer) = self.pointer.as_ref() else {
+            return;
+        };
         let Some(serial) = pointer
             .data::<PointerData>()
             .and_then(|d| d.latest_enter_serial())
@@ -443,7 +366,9 @@ impl AppState {
 
     fn apply_cursor_for_phase(&self, pointer: &wl_pointer::WlPointer, serial: u32) {
         match self.phase {
+            // Drawing: hide the cursor — our crosshair is what the user tracks.
             Phase::Drawing => pointer.set_cursor(serial, None, 0, 0),
+            // Picking: show the standard arrow via cursor-shape-v1.
             Phase::Picking => {
                 if let Some(device) = self.cursor_shape_device.as_ref() {
                     device.set_shape(serial, Shape::Default);
@@ -452,6 +377,7 @@ impl AppState {
         }
     }
 
+    /// Single entry point for initial key presses and synthetic repeats.
     fn handle_key_event(&mut self, event: KeyEvent) {
         if event.keysym == Keysym::Escape {
             self.decision = Decision::Cancel;
@@ -488,6 +414,8 @@ impl AppState {
                 self.needs_redraw = true;
             }
             Keysym::Delete => {
+                // Forget the currently-selected app from history (if it has
+                // been picked before). Backspace keeps its text-editing role.
                 let selected = self.picker.selected_index();
                 if self.picker.is_history_row(selected) {
                     self.picker.forget_at(selected);
@@ -506,187 +434,77 @@ impl AppState {
         }
     }
 
-    /// Compute the picker card's **global** position — centered on the
-    /// bbox center, then clamped inside the overlay that contains that center
-    /// so the card stays on one monitor.
-    fn picker_card_center(&self) -> Option<((i32, i32), Bbox)> {
-        let bbox = self.stroke.bbox(0);
-        let cx = bbox.x + bbox.w as i32 / 2;
-        let cy = bbox.y + bbox.h as i32 / 2;
-        let idx = self.overlay_containing_global(cx, cy)?;
-        Some(((cx, cy), self.overlays[idx].rect()))
-    }
+    fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
+        let (w_log, h_log) = (self.width, self.height);
+        if w_log == 0 || h_log == 0 {
+            return Ok(());
+        }
+        // Render into a physical-pixel buffer so HiDPI monitors stay sharp.
+        // Vector shapes are rendered through a scale transform; cosmic-text
+        // gets the scale directly so glyphs rasterize at native density.
+        let scale = self.scale.max(1) as u32;
+        let w = w_log * scale;
+        let h = h_log * scale;
+        let stride = w as i32 * 4;
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .context("creating shm buffer")?;
 
-    fn draw_all(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
-        let picking = self.phase == Phase::Picking;
-        let caret_visible = if picking {
-            caret_visible_at(self.caret_blink_reset.elapsed())
-        } else {
-            false
+        // Keep the pixmap across frames; only reallocate when physical size
+        // changes (logical resize OR scale change). Saves a large malloc/free
+        // per draw call at steady state.
+        let needs_new_pixmap = self
+            .pixmap
+            .as_ref()
+            .map(|p| p.width() != w || p.height() != h)
+            .unwrap_or(true);
+        if needs_new_pixmap {
+            self.pixmap = Some(Pixmap::new(w, h).context("creating pixmap")?);
+        }
+        let pixmap = self.pixmap.as_mut().expect("pixmap just ensured");
+        pixmap.fill(Color::from_rgba8(0, 0, 0, BG_DIM_ALPHA));
+
+        let stroke_alpha = match self.phase {
+            Phase::Drawing => STROKE_COLOR.3,
+            Phase::Picking => STROKE_DIM_ALPHA,
         };
-        if picking {
-            self.caret_last_visible = caret_visible;
+        draw_stroke(pixmap, &self.stroke, stroke_alpha, scale);
+
+        if self.phase == Phase::Drawing && !self.drawing && !self.has_drawn {
+            if let Some((cx, cy)) = self.cursor {
+                draw_crosshair(pixmap, cx, cy, scale);
+            }
         }
 
-        // Compute picker card anchor once, in global coords.
-        let card_anchor = if picking { self.picker_card_center() } else { None };
-
-        // Pre-compute hovered_rel against the (possibly-stale) previous card
-        // rect; picker::draw will refresh `last_card` with the new value.
-        let hovered_rel = if picking {
-            self.last_card.and_then(|card| {
-                let (cx, cy) = self.cursor_global?;
+        if self.phase == Phase::Picking {
+            let bbox = self.stroke.bbox(0);
+            let cx = bbox.x + (bbox.w as i32 / 2);
+            let cy = bbox.y + (bbox.h as i32 / 2);
+            let caret_visible = caret_visible_at(self.caret_blink_reset.elapsed());
+            self.caret_last_visible = caret_visible;
+            // Hover + hit-testing stay in LOGICAL pixels (pointer events are
+            // delivered in surface-local logical coords); the picker reports
+            // `last_card` in logical so the two naturally align.
+            let hovered_rel = self.last_card.and_then(|card| {
+                let (cx, cy) = self.cursor?;
                 if !card.contains(cx as i32, cy as i32) {
                     return None;
                 }
                 card.item_at(cy as i32, self.picker.visible_count())
-            })
-        } else {
-            None
-        };
-
-        // Ensure an icon cache exists for every active scale BEFORE the render
-        // loop so we can borrow mutably one at a time inside the loop without
-        // re-hashing per overlay.
-        for overlay in &self.overlays {
-            self.icon_caches
-                .entry(overlay.scale)
-                .or_insert_with(|| IconCache::new(24 * overlay.scale.max(1) as u32));
-        }
-
-        let mut new_card: Option<picker::CardRect> = None;
-        for idx in 0..self.overlays.len() {
-            if !self.overlays[idx].configured {
-                continue;
-            }
-            let drawn_card = self.draw_overlay(
-                idx,
-                qh,
+            });
+            let card = picker::draw(
+                pixmap,
+                &self.picker,
+                &mut self.text,
+                &mut self.icons,
+                (cx, cy),
+                (w_log, h_log),
                 caret_visible,
-                card_anchor,
                 hovered_rel,
-            )?;
-            if let Some(c) = drawn_card {
-                new_card = Some(c);
-            }
-        }
-        if picking {
-            self.last_card = new_card.or(self.last_card);
-        }
-        Ok(())
-    }
-
-    fn draw_overlay(
-        &mut self,
-        idx: usize,
-        qh: &QueueHandle<Self>,
-        caret_visible: bool,
-        card_anchor: Option<((i32, i32), Bbox)>,
-        hovered_rel: Option<usize>,
-    ) -> Result<Option<picker::CardRect>> {
-        let (origin, w_log, h_log, scale) = {
-            let o = &self.overlays[idx];
-            (o.origin, o.width, o.height, o.scale.max(1) as u32)
-        };
-        if w_log == 0 || h_log == 0 {
-            return Ok(None);
-        }
-
-        let w_phys = w_log * scale;
-        let h_phys = h_log * scale;
-        let stride = w_phys as i32 * 4;
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(w_phys as i32, h_phys as i32, stride, wl_shm::Format::Argb8888)
-            .context("creating shm buffer")?;
-
-        // Ensure this overlay's pixmap is sized to physical dims.
-        {
-            let overlay = &mut self.overlays[idx];
-            let needs_new = overlay
-                .pixmap
-                .as_ref()
-                .map(|p| p.width() != w_phys || p.height() != h_phys)
-                .unwrap_or(true);
-            if needs_new {
-                overlay.pixmap = Some(Pixmap::new(w_phys, h_phys).context("creating pixmap")?);
-            }
-        }
-
-        let phase = self.phase;
-        let drawing = self.drawing;
-        let has_drawn = self.has_drawn;
-        let cursor_global = self.cursor_global;
-        let stroke_alpha = match phase {
-            Phase::Drawing => STROKE_COLOR.3,
-            Phase::Picking => STROKE_DIM_ALPHA,
-        };
-
-        // Card (if picking) — translate global position to this overlay's local
-        // frame so picker::draw sees a centered card.
-        let mut drawn_card: Option<picker::CardRect> = None;
-
-        let pixmap = self.overlays[idx].pixmap.as_mut().expect("pixmap just ensured");
-        pixmap.fill(Color::from_rgba8(0, 0, 0, BG_DIM_ALPHA));
-
-        draw_stroke_global(pixmap, &self.stroke, stroke_alpha, scale, origin);
-
-        if phase == Phase::Drawing && !drawing && !has_drawn {
-            if let Some((gx, gy)) = cursor_global {
-                let lx = gx - origin.0 as f32;
-                let ly = gy - origin.1 as f32;
-                if lx >= 0.0 && ly >= 0.0 && lx < w_log as f32 && ly < h_log as f32 {
-                    draw_crosshair(pixmap, lx, ly, scale);
-                }
-            }
-        }
-
-        if phase == Phase::Picking {
-            if let Some(((gcx, gcy), home_rect)) = card_anchor {
-                // Only the "home" overlay gets the card rendered; the others
-                // just show the dim background (and the faded stroke).
-                if home_rect.x == origin.0 && home_rect.y == origin.1 {
-                    let local_cx = gcx - origin.0;
-                    let local_cy = gcy - origin.1;
-                    let icons = self
-                        .icon_caches
-                        .get_mut(&(scale as i32))
-                        .expect("icon cache ensured");
-                    let card_local = picker::draw(
-                        pixmap,
-                        &self.picker,
-                        &mut self.text,
-                        icons,
-                        (local_cx, local_cy),
-                        (w_log, h_log),
-                        caret_visible,
-                        hovered_rel.and_then(|r| {
-                            // hovered_rel comes from the *previous* card (global);
-                            // pass through only if the cursor is still inside
-                            // this overlay's frame.
-                            let (gx, gy) = cursor_global?;
-                            let lx = gx - origin.0 as f32;
-                            let ly = gy - origin.1 as f32;
-                            if lx < 0.0 || ly < 0.0 || lx >= w_log as f32 || ly >= h_log as f32 {
-                                None
-                            } else {
-                                Some(r)
-                            }
-                        }),
-                        scale,
-                    );
-                    // Promote local card rect back to global for hit-tests.
-                    drawn_card = Some(picker::CardRect {
-                        x: card_local.x + origin.0,
-                        y: card_local.y + origin.1,
-                        w: card_local.w,
-                        h: card_local.h,
-                        recent_header_y: card_local.recent_header_y.map(|v| v + origin.1),
-                        others_header_y: card_local.others_header_y.map(|v| v + origin.1),
-                        recent_count: card_local.recent_count,
-                    });
-                }
-            }
+                scale,
+            );
+            self.last_card = Some(card);
         }
 
         // tiny-skia is RGBA in memory; Wayland Argb8888 on LE is BGRA byte order.
@@ -698,38 +516,26 @@ impl AppState {
             dst[3] = chunk[3];
         }
 
-        let surface = self.overlays[idx].surface.wl_surface();
-        surface.damage_buffer(0, 0, w_phys as i32, h_phys as i32);
+        let surface = self.layer.wl_surface();
+        surface.damage_buffer(0, 0, w as i32, h as i32);
         buffer
             .attach_to(surface)
             .context("attaching buffer to surface")?;
         surface.frame(qh, surface.clone());
         surface.commit();
-        Ok(drawn_card)
+        Ok(())
     }
 }
 
-/// Draw the stroke onto a single overlay's pixmap. `origin` subtracts the
-/// overlay's global top-left so points outside this overlay fall off-pixmap
-/// (tiny-skia clips naturally); continuous cross-monitor strokes thus render
-/// as seamless lines across adjacent overlays.
-fn draw_stroke_global(
-    pixmap: &mut Pixmap,
-    stroke: &Stroke,
-    alpha: u8,
-    scale: u32,
-    origin: (i32, i32),
-) {
+fn draw_stroke(pixmap: &mut Pixmap, stroke: &Stroke, alpha: u8, scale: u32) {
     let pts = stroke.points();
     if pts.len() < 2 {
         return;
     }
-    let ox = origin.0 as f32;
-    let oy = origin.1 as f32;
     let mut pb = PathBuilder::new();
-    pb.move_to(pts[0].x - ox, pts[0].y - oy);
+    pb.move_to(pts[0].x, pts[0].y);
     for p in &pts[1..] {
-        pb.line_to(p.x - ox, p.y - oy);
+        pb.line_to(p.x, p.y);
     }
     let Some(path) = pb.finish() else { return };
     let mut paint = Paint::default();
@@ -777,14 +583,15 @@ impl CompositorHandler for AppState {
         factor: i32,
     ) {
         let factor = factor.max(1);
-        let Some(idx) = self.overlay_for_surface(surface) else { return };
-        if factor == self.overlays[idx].scale {
+        if factor == self.scale {
             return;
         }
-        self.overlays[idx].scale = factor;
+        self.scale = factor;
         surface.set_buffer_scale(factor);
-        self.overlays[idx].pixmap = None;
-        self.ensure_icon_cache(factor);
+        // Icons are baked at a fixed physical size; rebuild for the new scale.
+        self.icons = IconCache::new(24 * factor as u32);
+        // Invalidate the pixmap — next draw reallocates at the new physical size.
+        self.pixmap = None;
         self.needs_redraw = true;
     }
     fn transform_changed(
@@ -803,6 +610,9 @@ impl CompositorHandler for AppState {
         _: u32,
     ) {
         // `frame` is a compositor "present-ready" signal, not a dirty signal.
+        // Actual state changes set `needs_redraw` at their source (pointer,
+        // keyboard, axis, configure, blink transition). Setting it here used
+        // to lock us into a 60 fps redraw loop while the picker sat idle.
     }
     fn surface_enter(
         &mut self,
@@ -826,68 +636,9 @@ impl OutputHandler for AppState {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-
-    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        // Avoid double-creating if we somehow get a duplicate event.
-        if self
-            .overlays
-            .iter()
-            .any(|o| o.output.id() == output.id())
-        {
-            return;
-        }
-        let info = self.output_state.info(&output);
-        let origin = info
-            .as_ref()
-            .and_then(|i| i.logical_position)
-            .unwrap_or((0, 0));
-        let scale = info.as_ref().map(|i| i.scale_factor).unwrap_or(1).max(1);
-
-        let surface = self.compositor_state.create_surface(qh);
-        let layer = self.layer_shell.create_layer_surface(
-            qh,
-            surface,
-            Layer::Overlay,
-            Some("magicwand"),
-            Some(&output),
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.set_exclusive_zone(-1);
-        layer.set_size(0, 0);
-        layer.wl_surface().set_buffer_scale(scale);
-        layer.commit();
-
-        self.ensure_icon_cache(scale);
-        self.overlays.push(OutputOverlay {
-            output,
-            surface: layer,
-            origin,
-            width: 0,
-            height: 0,
-            scale,
-            configured: false,
-            pixmap: None,
-        });
-    }
-
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        let info = self.output_state.info(&output);
-        let Some(idx) = self.overlays.iter().position(|o| o.output.id() == output.id()) else {
-            return;
-        };
-        if let Some(pos) = info.as_ref().and_then(|i| i.logical_position) {
-            if self.overlays[idx].origin != pos {
-                self.overlays[idx].origin = pos;
-                self.needs_redraw = true;
-            }
-        }
-    }
-
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.overlays.retain(|o| o.output.id() != output.id());
-        self.needs_redraw = true;
-    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
 impl SeatHandler for AppState {
@@ -945,27 +696,21 @@ impl PointerHandler for AppState {
         events: &[PointerEvent],
     ) {
         for ev in events {
-            let Some(idx) = self.overlay_for_surface(&ev.surface) else {
-                continue;
-            };
-            let origin = self.overlays[idx].origin;
-            let (lx, ly) = ev.position;
-            let gx = lx as f32 + origin.0 as f32;
-            let gy = ly as f32 + origin.1 as f32;
-
             match ev.kind {
                 PointerEventKind::Enter { serial } => {
                     self.apply_cursor_for_phase(pointer, serial);
-                    self.cursor_global = Some((gx, gy));
+                    let (x, y) = ev.position;
+                    self.cursor = Some((x as f32, y as f32));
                     self.needs_redraw = true;
                 }
                 PointerEventKind::Motion { .. } => {
-                    self.cursor_global = Some((gx, gy));
+                    let (x, y) = ev.position;
+                    self.cursor = Some((x as f32, y as f32));
                     if self.phase == Phase::Drawing && self.drawing {
                         if self.rect_start.is_some() {
-                            self.update_rect_stroke(gx, gy);
+                            self.update_rect_stroke(x as f32, y as f32);
                         } else {
-                            self.stroke.push(gx, gy);
+                            self.stroke.push(x as f32, y as f32);
                         }
                     }
                     self.needs_redraw = true;
@@ -974,13 +719,15 @@ impl PointerHandler for AppState {
                     (Phase::Drawing, BTN_LEFT) => {
                         self.drawing = true;
                         self.has_drawn = true;
+                        let (x, y) = ev.position;
+                        let (xf, yf) = (x as f32, y as f32);
                         self.stroke.clear();
                         if self.shift_held {
-                            self.rect_start = Some((gx, gy));
-                            self.update_rect_stroke(gx, gy);
+                            self.rect_start = Some((xf, yf));
+                            self.update_rect_stroke(xf, yf);
                         } else {
                             self.rect_start = None;
-                            self.stroke.push(gx, gy);
+                            self.stroke.push(xf, yf);
                         }
                         self.needs_redraw = true;
                     }
@@ -988,16 +735,19 @@ impl PointerHandler for AppState {
                         self.decision = Decision::Cancel;
                     }
                     (Phase::Picking, BTN_LEFT) => {
+                        let (x, y) = ev.position;
                         if let Some(card) = self.last_card {
-                            if !card.contains(gx as i32, gy as i32) {
+                            if !card.contains(x as i32, y as i32) {
                                 self.decision = Decision::Cancel;
                                 continue;
                             }
                             if let Some(rel_idx) =
-                                card.item_at(gy as i32, self.picker.visible_count())
+                                card.item_at(y as i32, self.picker.visible_count())
                             {
                                 let absolute = self.picker.scroll_offset() + rel_idx;
-                                if card.forget_button_hit(gx as i32, gy as i32)
+                                // If the click landed on the × button of a
+                                // history row, forget it instead of spawning.
+                                if card.forget_button_hit(x as i32, y as i32)
                                     && self.picker.is_history_row(absolute)
                                 {
                                     self.picker.forget_at(absolute);
@@ -1022,10 +772,7 @@ impl PointerHandler for AppState {
                     }
                 }
                 PointerEventKind::Leave { .. } => {
-                    // Only clear the cursor if the pointer has truly left
-                    // every overlay — during a cross-monitor drag we'll see
-                    // Leave on A before Enter on B.
-                    self.cursor_global = None;
+                    self.cursor = None;
                     self.needs_redraw = true;
                 }
                 PointerEventKind::Axis {
@@ -1101,16 +848,18 @@ impl KeyboardHandler for AppState {
         _: u32,
     ) {
         self.shift_held = modifiers.shift;
+        // If the user pressed/released Shift mid-drag, snap the stroke to
+        // the corresponding mode immediately.
         if self.phase == Phase::Drawing && self.drawing {
             if self.shift_held && self.rect_start.is_none() {
-                if let Some((cx, cy)) = self.cursor_global {
+                if let Some((cx, cy)) = self.cursor {
                     self.rect_start = Some((cx, cy));
                     self.update_rect_stroke(cx, cy);
                 }
             } else if !self.shift_held && self.rect_start.is_some() {
                 self.rect_start = None;
                 self.stroke.clear();
-                if let Some((cx, cy)) = self.cursor_global {
+                if let Some((cx, cy)) = self.cursor {
                     self.stroke.push(cx, cy);
                 }
             }
@@ -1126,30 +875,22 @@ impl ShmHandler for AppState {
 }
 
 impl LayerShellHandler for AppState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
-        // A single output's overlay closing (e.g. hotplug) shouldn't cancel
-        // the whole gesture — only cancel if the LAST overlay dies.
-        if let Some(idx) = self.overlay_for_layer(layer) {
-            self.overlays.remove(idx);
-        }
-        if self.overlays.is_empty() {
-            self.decision = Decision::Cancel;
-        }
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+        self.decision = Decision::Cancel;
     }
 
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        layer: &LayerSurface,
+        _: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        let Some(idx) = self.overlay_for_layer(layer) else { return };
         let (w, h) = configure.new_size;
-        self.overlays[idx].width = w.max(1);
-        self.overlays[idx].height = h.max(1);
-        self.overlays[idx].configured = true;
+        self.width = w.max(1);
+        self.height = h.max(1);
+        self.configured = true;
         self.needs_redraw = true;
     }
 }

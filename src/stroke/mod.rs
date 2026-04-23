@@ -67,12 +67,6 @@ impl Bbox {
         self
     }
 
-    pub fn contains_point(&self, px: i32, py: i32) -> bool {
-        px >= self.x
-            && px < self.x + self.w as i32
-            && py >= self.y
-            && py < self.y + self.h as i32
-    }
 }
 
 pub struct Stroke {
@@ -255,13 +249,4 @@ mod tests {
         assert_eq!(c.w, 400);
     }
 
-    #[test]
-    fn contains_point_matches_half_open_rect() {
-        let b = Bbox { x: 100, y: 100, w: 50, h: 50 };
-        assert!(b.contains_point(100, 100));
-        assert!(b.contains_point(149, 149));
-        assert!(!b.contains_point(150, 100)); // right edge exclusive
-        assert!(!b.contains_point(100, 150));
-        assert!(!b.contains_point(99, 100));
-    }
 }
