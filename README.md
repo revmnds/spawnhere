@@ -104,9 +104,19 @@ Rule matching uses the first path component of the chosen exec: `/usr/bin/kitty 
 
 Every spawn appends the exec to `~/.local/share/magicwand/history`. When the query is empty, the picker sorts recent picks to the top under a "Recent" section header, then everything else below under "Other apps". Delete the file to reset.
 
+## Multi-monitor
+
+The bind covers **every** attached output. Each monitor gets its own layer-shell surface; strokes and the final bbox live in a single global coordinate frame so:
+
+- You can press the bind on any monitor and start drawing.
+- You can drag a stroke across the bezel — it renders continuously on both sides.
+- The spawned window lands on whichever monitor contains the bbox center (and is clamped to that monitor so it never bleeds onto a neighbor).
+
+Outputs added or removed mid-gesture are handled (new overlays appear the next frame; a removed monitor's overlay is torn down without cancelling the gesture unless it was the last one).
+
 ## HiDPI
 
-The overlay honors the compositor's advertised scale factor via `wp_viewporter` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density; icons are rasterized at `24 × scale` pixels. Mixed-scale multi-monitor setups work per-monitor.
+Per-monitor scale is honored via `scale_factor_changed` + `set_buffer_scale`. Vector shapes and glyph rasterization run at physical pixel density on each output; icons are rasterized at `24 × scale` with one cache per distinct scale, so a 1× + 2× setup stays sharp on both without duplicate work.
 
 ## License
 

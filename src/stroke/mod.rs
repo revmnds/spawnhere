@@ -31,6 +31,48 @@ impl Bbox {
         }
         self
     }
+
+    /// Keep the bbox within an arbitrary output rect in the same coord frame.
+    /// Handles both single-monitor setups (rect at origin) and multi-monitor
+    /// (rect at a non-zero global position). If the bbox is larger than the
+    /// rect, shrink + origin-clamp so the spawned window is at least fully
+    /// visible on that output.
+    pub fn clamp_to_rect(mut self, rect: Bbox) -> Self {
+        let rx = rect.x;
+        let ry = rect.y;
+        let rw = rect.w as i32;
+        let rh = rect.h as i32;
+        if self.w as i32 > rw {
+            self.w = rect.w;
+            self.x = rx;
+        } else {
+            if self.x < rx {
+                self.x = rx;
+            }
+            if self.x + self.w as i32 > rx + rw {
+                self.x = rx + rw - self.w as i32;
+            }
+        }
+        if self.h as i32 > rh {
+            self.h = rect.h;
+            self.y = ry;
+        } else {
+            if self.y < ry {
+                self.y = ry;
+            }
+            if self.y + self.h as i32 > ry + rh {
+                self.y = ry + rh - self.h as i32;
+            }
+        }
+        self
+    }
+
+    pub fn contains_point(&self, px: i32, py: i32) -> bool {
+        px >= self.x
+            && px < self.x + self.w as i32
+            && py >= self.y
+            && py < self.y + self.h as i32
+    }
 }
 
 pub struct Stroke {
@@ -158,5 +200,68 @@ mod tests {
         assert_eq!(m.h, 500);
         assert_eq!(m.x, 0);
         assert_eq!(m.y, 0);
+    }
+
+    #[test]
+    fn clamp_slides_right_edge_overflow_back_in() {
+        // Single-monitor bug regression: stroke near right edge + enforce_min
+        // grew it past screen width. Expect the box to slide left.
+        let screen = Bbox { x: 0, y: 0, w: 1920, h: 1080 };
+        let b = Bbox { x: 1550, y: 500, w: 400, h: 300 };
+        let c = b.clamp_to_rect(screen);
+        assert_eq!(c.x + c.w as i32, 1920);
+        assert_eq!(c.w, 400);
+    }
+
+    #[test]
+    fn clamp_handles_negative_origin() {
+        let screen = Bbox { x: 0, y: 0, w: 1920, h: 1080 };
+        let b = Bbox { x: -50, y: -30, w: 400, h: 300 };
+        let c = b.clamp_to_rect(screen);
+        assert_eq!(c.x, 0);
+        assert_eq!(c.y, 0);
+    }
+
+    #[test]
+    fn clamp_shrinks_oversized_bbox() {
+        let screen = Bbox { x: 0, y: 0, w: 1920, h: 1080 };
+        let b = Bbox { x: 0, y: 0, w: 3000, h: 2000 };
+        let c = b.clamp_to_rect(screen);
+        assert_eq!(c.w, 1920);
+        assert_eq!(c.h, 1080);
+        assert_eq!(c.x, 0);
+        assert_eq!(c.y, 0);
+    }
+
+    #[test]
+    fn clamp_to_rect_respects_non_zero_origin() {
+        // Second monitor sits at x=1920. A stroke centered there with min
+        // enforcement pushing past its right edge should slide back into that
+        // monitor, not into monitor 1.
+        let monitor = Bbox { x: 1920, y: 0, w: 1920, h: 1080 };
+        let b = Bbox { x: 3700, y: 500, w: 400, h: 300 };
+        let c = b.clamp_to_rect(monitor);
+        assert_eq!(c.x + c.w as i32, monitor.x + monitor.w as i32);
+        assert_eq!(c.w, 400);
+    }
+
+    #[test]
+    fn clamp_to_rect_handles_left_overshoot_on_second_monitor() {
+        // bbox origin is to the LEFT of the monitor — slide in.
+        let monitor = Bbox { x: 1920, y: 0, w: 1920, h: 1080 };
+        let b = Bbox { x: 1800, y: 500, w: 400, h: 300 };
+        let c = b.clamp_to_rect(monitor);
+        assert_eq!(c.x, 1920);
+        assert_eq!(c.w, 400);
+    }
+
+    #[test]
+    fn contains_point_matches_half_open_rect() {
+        let b = Bbox { x: 100, y: 100, w: 50, h: 50 };
+        assert!(b.contains_point(100, 100));
+        assert!(b.contains_point(149, 149));
+        assert!(!b.contains_point(150, 100)); // right edge exclusive
+        assert!(!b.contains_point(100, 150));
+        assert!(!b.contains_point(99, 100));
     }
 }
