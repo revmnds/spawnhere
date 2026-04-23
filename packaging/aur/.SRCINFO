@@ -1,0 +1,18 @@
+pkgbase = magicwand
+	pkgdesc = Draw a gesture on Hyprland, spawn a floating window exactly where you drew
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/yourname/magicwand
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = pkgconf
+	depends = hyprland
+	depends = wayland
+	depends = libxkbcommon
+	depends = fontconfig
+	depends = freetype2
+	source = magicwand-0.1.0.tar.gz::https://github.com/yourname/magicwand/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = magicwand

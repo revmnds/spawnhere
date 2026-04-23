@@ -3,16 +3,28 @@ use clap::Parser;
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
-mod backend;
+mod apps;
+mod config;
+mod history;
+mod hyprland;
 mod overlay;
+mod picker;
 mod stroke;
+
+use history::History;
 
 #[derive(Parser)]
 #[command(name = "magicwand", version, about = "Draw a gesture to spawn a floating window")]
 struct Cli {
-    /// Command to spawn at the drawn bbox (e.g. "kitty").
-    #[arg(long, short = 's')]
-    spawn: String,
+    /// Command to spawn directly at the drawn bbox (skips the picker).
+    /// If omitted, an app picker appears after the gesture.
+    #[arg(long, short = 's', conflicts_with = "term")]
+    spawn: Option<String>,
+
+    /// Shortcut for `--spawn $TERMINAL` (falls back to `config.default_term`,
+    /// then `kitty`). Draws the gesture, skips the picker, spawns a terminal.
+    #[arg(long, short = 't')]
+    term: bool,
 
     /// Minimum width in pixels if stroke bbox is smaller.
     #[arg(long, default_value_t = 400)]
@@ -22,55 +34,56 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     min_height: u32,
 
-    /// Extra pixels added to the bbox on each side.
-    #[arg(long, default_value_t = 8)]
+    /// Extra pixels added to the bbox on each side (0 = exact stroke fidelity).
+    #[arg(long, default_value_t = 0)]
     padding: u32,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Single-instance: if another magicwand is already running, do nothing.
-    // The lock is held by the OS until this process exits.
+    hyprland::ensure_running().context("Hyprland not detected")?;
+
+    // Single-instance: another magicwand already running? Exit quietly so the
+    // same keybind can be spammed without stacking overlays.
     let _lock = match acquire_single_instance_lock()? {
         Some(f) => f,
         None => return Ok(()),
     };
 
-    let backend = backend::detect().context("no supported window manager detected")?;
+    let cfg = config::Config::load();
 
-    let outcome = overlay::run().context("overlay failed")?;
+    let preset_exec = if cli.term {
+        Some(config::resolve_terminal(&cfg))
+    } else {
+        cli.spawn.clone()
+    };
 
-    let stroke = match outcome {
-        overlay::Outcome::Spawn(s) => s,
+    let outcome = overlay::run(overlay::RunConfig {
+        preset_exec,
+        padding: cli.padding,
+        min_width: cli.min_width,
+        min_height: cli.min_height,
+        history: History::load(),
+    })
+    .context("overlay failed")?;
+
+    let (bbox, exec) = match outcome {
+        overlay::Outcome::Spawn { bbox, exec } => (bbox, exec),
         overlay::Outcome::Cancelled => return Ok(()),
     };
 
-    let raw = stroke.bbox(cli.padding);
-    if raw.w == 0 && raw.h == 0 {
-        return Ok(());
-    }
-
-    let bbox = raw.enforce_min(cli.min_width, cli.min_height);
-    backend.spawn_floating(&cli.spawn, bbox)?;
+    let bbox = config::apply_rule(bbox, cfg.rule_for(&exec));
+    hyprland::spawn_floating(&exec, bbox)?;
+    History::record(&exec);
     Ok(())
 }
 
 fn lock_path() -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let uid = unsafe { libc_geteuid() };
-            PathBuf::from(format!("/tmp/magicwand-{uid}"))
-        });
+        .expect("XDG_RUNTIME_DIR is set under systemd-logind (required by Hyprland)");
     dir.join("magicwand.lock")
-}
-
-unsafe fn libc_geteuid() -> u32 {
-    extern "C" {
-        fn geteuid() -> u32;
-    }
-    geteuid()
 }
 
 /// Returns `Some(File)` if we acquired the single-instance lock (caller must

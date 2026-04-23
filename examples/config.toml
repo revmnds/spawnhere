@@ -1,0 +1,39 @@
+# ~/.config/magicwand/config.toml
+#
+# All fields are optional — magicwand runs fine with no file at all. Copy this
+# to `~/.config/magicwand/config.toml` and edit to taste.
+
+# Terminal used when invoking `magicwand --term` (or `-t`). Falls back to the
+# `$TERMINAL` environment variable, then `kitty`.
+default_term = "kitty"
+
+# Per-app bounding-box post-processing. Keys match the first whitespace-
+# separated token of the chosen `Exec=` line (absolute paths are stripped, so
+# `/usr/bin/kitty -1 fish` matches `[rules.kitty]`).
+#
+# Fields (all optional):
+#   min_width   — floor for bbox.w in pixels (bumps small strokes up)
+#   min_height  — floor for bbox.h in pixels
+#   cell_px     — [cell_w, cell_h] in pixels. If set, the final bbox.w / bbox.h
+#                 are rounded DOWN to the nearest multiple of cell size so
+#                 terminal windows land on integer column/row boundaries.
+#                 A drawn rectangle becomes a clean N×M cell grid.
+
+[rules.kitty]
+min_width = 480
+# Typical kitty cell at 16pt Fira Code on a 1× display. Adjust to match your
+# font — run `kitty +kitten panel --help` or inspect your kitty font metrics.
+cell_px = [10, 22]
+
+[rules.foot]
+min_width = 480
+cell_px = [9, 18]
+
+[rules.firefox]
+min_width = 1200
+min_height = 800
+
+[rules.code]
+# VS Code — generous floor so the side panels are usable.
+min_width = 1100
+min_height = 700

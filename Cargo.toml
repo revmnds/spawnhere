@@ -14,8 +14,18 @@ toml = "0.8"
 
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+calloop = "0.13"
+calloop-wayland-source = "0.3"
 
 tiny-skia = "0.11"
+
+# App picker
+freedesktop-desktop-entry = "0.7"
+freedesktop-icons = "0.4"
+cosmic-text = "0.12"
+nucleo-matcher = "0.3"
+resvg = "0.45"
+usvg = "0.45"
 
 [profile.release]
 lto = "thin"

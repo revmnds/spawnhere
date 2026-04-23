@@ -46,6 +46,11 @@ impl Stroke {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.points.clear();
+        self.started = None;
+    }
+
     pub fn push(&mut self, x: f32, y: f32) {
         let now = Instant::now();
         let t = match self.started {
@@ -60,11 +65,6 @@ impl Stroke {
 
     pub fn points(&self) -> &[Point] {
         &self.points
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.points.is_empty()
     }
 
     pub fn bbox(&self, padding: u32) -> Bbox {
