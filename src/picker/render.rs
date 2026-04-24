@@ -1,6 +1,6 @@
 use super::{PickerState, TextRenderer, VISIBLE_ITEMS};
 use crate::apps::IconCache;
-use cosmic_text::Weight;
+use crate::picker::text::Weight;
 use tiny_skia::{
     FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform,
 };

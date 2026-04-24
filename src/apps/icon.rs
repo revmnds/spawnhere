@@ -33,23 +33,11 @@ fn lookup_and_render(name: &str, size: u32) -> Option<Pixmap> {
 fn render_icon(path: &PathBuf, size: u32) -> Option<Pixmap> {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     match ext.to_lowercase().as_str() {
-        "svg" | "svgz" => render_svg(path, size),
         "png" | "xpm" => render_png(path, size),
+        // SVG paths fall through; the picker renderer draws a colored-letter
+        // fallback tile for any app whose icon we can't rasterize.
         _ => None,
     }
-}
-
-fn render_svg(path: &PathBuf, size: u32) -> Option<Pixmap> {
-    let bytes = std::fs::read(path).ok()?;
-    let opt = usvg::Options::default();
-    let tree = usvg::Tree::from_data(&bytes, &opt).ok()?;
-
-    let svg_size = tree.size();
-    let scale = (size as f32) / svg_size.width().max(svg_size.height());
-    let mut pix = Pixmap::new(size, size)?;
-    let transform = tiny_skia::Transform::from_scale(scale, scale);
-    resvg::render(&tree, transform, &mut pix.as_mut());
-    Some(pix)
 }
 
 fn render_png(path: &PathBuf, size: u32) -> Option<Pixmap> {

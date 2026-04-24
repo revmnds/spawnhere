@@ -36,7 +36,7 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::Proxy;
-use cosmic_text::Weight;
+use crate::picker::text::Weight;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
 use wayland_client::{
     globals::registry_queue_init,

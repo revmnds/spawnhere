@@ -7,7 +7,7 @@ use nucleo_matcher::{
 };
 
 mod render;
-mod text;
+pub mod text;
 
 pub use render::{draw, CardRect};
 pub use text::TextRenderer;
