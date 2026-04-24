@@ -42,3 +42,48 @@ min_height = 800
 # VS Code — generous floor so the side panels are usable.
 min_width = 1100
 min_height = 700
+
+# Gesture behaviour. Defaults match the Photoshop/Figma convention:
+#
+#   drag          → rectangle (the new default — matches every design tool)
+#   Shift + drag  → rectangle constrained to 1:1 (square)
+#   Alt + drag    → freehand (the legacy spawnhere mode; the bbox of your stroke
+#                   is the spawn zone — draw a squiggle, the letter R, whatever)
+#   click (no drag) → window opens centred on the click at `click_spawn_*` size
+#
+# Anything below `drag_threshold_px` of travel counts as a click, so a tiny
+# jitter between press and release no longer spawns a sliver window.
+#
+# Freehand lives on Alt (not Ctrl) because Ctrl is already reserved for
+# "escape from --default into the picker" at release time — overloading it
+# would silently change the stroke shape every time a pinned-app user wanted
+# the picker for one spawn.
+#
+# To restore the pre-rectangle-default era:
+#
+#   [gesture]
+#   default = "freehand"
+#
+# `square_modifier` and `freehand_modifier` accept "shift", "ctrl", or "alt".
+# If you flip `default = "freehand"`, `square_modifier` degrades to a plain
+# rectangle (the 1:1 constraint can't attach to a freehand stroke).
+#
+# `min_width` / `min_height` are a global floor for any drawn bbox — a tiny
+# drag gets bumped up to this size centred on the drawn region. Per-app
+# `[rules.<class>]` entries apply on top and can raise the floor further.
+# Set to 0 to disable the global floor entirely.
+#
+# `click_spawn_width` / `click_spawn_height` control what a click-without-drag
+# spawns as: a window of that size centred on the click. Omit either (or set
+# to 0) to fall back to "app's natural size at the click point".
+
+[gesture]
+default            = "rectangle"
+square_modifier    = "shift"
+freehand_modifier  = "alt"
+drag_threshold_px  = 5.0
+show_dimensions    = true
+min_width          = 320
+min_height         = 200
+click_spawn_width  = 720
+click_spawn_height = 480

@@ -2,44 +2,44 @@ use super::{PickerState, TextRenderer, VISIBLE_ITEMS};
 use crate::apps::IconCache;
 use crate::picker::text::Weight;
 use tiny_skia::{
-    FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform,
+    FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke as SkStroke, Transform,
 };
 
-pub const CARD_WIDTH: u32 = 600;
+pub const CARD_WIDTH: u32 = 520;
 
 // Spacing scale — all paddings/gaps pick from here so visual rhythm stays
 // consistent and tuning one value doesn't leave stragglers behind.
-const SPACE_XS: i32 = 4;
-const SPACE_SM: i32 = 8;
-const SPACE_MD: i32 = 12;
-const SPACE_XL: i32 = 20;
+const SPACE_XS: i32 = 3;
+const SPACE_SM: i32 = 6;
+const SPACE_MD: i32 = 10;
+const SPACE_XL: i32 = 14;
 
 // Font scale. INPUT is the largest (primary affordance), BODY the row name,
 // HEADER/HINT the quiet supporting text. Keep these in sync with the spacing
 // scale: larger text wants more breathing room.
-const FONT_INPUT: f32 = 15.0;
-const FONT_BODY: f32 = 14.0;
-const FONT_HEADER: f32 = 11.0;
-const FONT_HINT: f32 = 11.0;
+const FONT_INPUT: f32 = 13.5;
+const FONT_BODY: f32 = 13.0;
+const FONT_HEADER: f32 = 10.0;
+const FONT_HINT: f32 = 10.5;
 
 const CARD_PADDING: i32 = SPACE_XL;
-const SEARCH_HEIGHT: i32 = 44;
-const SEPARATOR_GAP: i32 = SPACE_MD;
-const ITEM_HEIGHT: i32 = 40;
-const ICON_SIZE: u32 = 24;
-const SCROLL_RAIL_W: i32 = 3;
+const SEARCH_HEIGHT: i32 = 34;
+const SEPARATOR_GAP: i32 = SPACE_SM;
+const ITEM_HEIGHT: i32 = 30;
+pub const ICON_SIZE: u32 = 18;
+const SCROLL_RAIL_W: i32 = 2;
 const SCROLL_RAIL_GAP: i32 = SPACE_XS;
 /// Vertical space for the "Recent" / "Other apps" section headers.
-const SECTION_HEADER_H: i32 = 22;
+const SECTION_HEADER_H: i32 = 18;
 /// Footer strip holding keyboard hints. Discoverability without docs.
-const FOOTER_HEIGHT: i32 = 28;
+const FOOTER_HEIGHT: i32 = 24;
 /// One-shot onboarding toast shown after the user's first pin this session.
 /// Explains how to launch/change the default so they don't get trapped.
-const TOAST_HEIGHT: i32 = 44;
+const TOAST_HEIGHT: i32 = 36;
 /// Square hit-box for the × "forget" button on history rows (logical px).
-const FORGET_BTN_SIZE: i32 = 22;
+const FORGET_BTN_SIZE: i32 = 18;
 /// Right-edge inset for the × button within a row.
-const FORGET_BTN_INSET: i32 = 6;
+const FORGET_BTN_INSET: i32 = 4;
 
 // All layout math in this file is in **logical pixels**. Physical-pixel
 // scaling happens at the edges:
@@ -365,24 +365,51 @@ fn draw_search(
         pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
     }
 
-    // Column alignment with the row list below: rows have icon at x+SPACE_SM
-    // (24 px wide) and name at x+44, with a 12 px gap between icon edge and
-    // name. Mirror that here so the search text and app names share a baseline.
-    let prompt_size: f32 = 18.0;
-    let prompt_x = x + SPACE_SM + 2;
-    let prompt_y = y + (SEARCH_HEIGHT - prompt_size as i32) / 2;
-    text.draw(
-        pixmap,
-        prompt_x * s_i,
-        prompt_y * s_i,
-        "🔍",
-        prompt_size * s_f,
-        prompt_size * s_f,
-        (176, 128, 255, 255),
-    );
+    // Magnifier glyph drawn geometrically: Inter has no emoji coverage and
+    // fontdue does not fall back to a system emoji font, so we stroke a small
+    // circle + handle in tiny-skia — matches the vector language of the
+    // stroke overlay and never depends on a font we don't control.
+    let glyph_box = ICON_SIZE as i32;
+    let cx = (x + SPACE_SM + glyph_box / 2) as f32;
+    let cy = (y + SEARCH_HEIGHT / 2) as f32;
+    let r = 4.5_f32;
+    let mut lens = Paint::default();
+    lens.set_color_rgba8(176, 128, 255, 255);
+    lens.anti_alias = true;
+    let mut pb = PathBuilder::new();
+    pb.push_circle(cx, cy, r);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(
+            &path,
+            &lens,
+            &SkStroke { width: 1.5, ..Default::default() },
+            t,
+            None,
+        );
+    }
+    let h_start_x = cx + (r * 0.707);
+    let h_start_y = cy + (r * 0.707);
+    let h_end_x = h_start_x + 3.2;
+    let h_end_y = h_start_y + 3.2;
+    let mut handle = PathBuilder::new();
+    handle.move_to(h_start_x, h_start_y);
+    handle.line_to(h_end_x, h_end_y);
+    if let Some(path) = handle.finish() {
+        pixmap.stroke_path(
+            &path,
+            &lens,
+            &SkStroke { width: 1.5, line_cap: tiny_skia::LineCap::Round, ..Default::default() },
+            t,
+            None,
+        );
+    }
 
     let text_x = x + SPACE_SM + ICON_SIZE as i32 + SPACE_MD;
-    let text_y = y + (SEARCH_HEIGHT - FONT_INPUT as i32) / 2 - 1;
+    // Center the text's cap-height inside the search bar. Text is drawn with
+    // baseline ≈ 0.8 × size below `y` (see TextRenderer::baseline_offset), and
+    // Inter's cap height is ≈ 0.72 × size, so the visual centerline sits
+    // ≈ 0.44 × size below `y`.
+    let text_y = y + SEARCH_HEIGHT / 2 - (FONT_INPUT * 0.44) as i32;
     let query_width_phys = if query.is_empty() {
         let placeholder = if loading {
             "Loading apps…"
@@ -415,12 +442,15 @@ fn draw_search(
     };
 
     if caret_visible {
-        // Caret position is in PHYSICAL pixels because query_width_phys is
-        // physical. Draw with identity transform against the physical pixmap.
+        // Caret spans cap-top → baseline + small descender pad so it visually
+        // tracks the text it sits next to. Drawn in physical pixels because
+        // `query_width_phys` is already physical.
         let caret_x_phys = text_x as f32 * s_f + query_width_phys + 1.0 * s_f;
-        let caret_y_phys = (text_y as f32 + 2.0) * s_f;
+        let caret_top_logical = text_y as f32 + FONT_INPUT * 0.1;
+        let caret_h_logical = FONT_INPUT * 0.95;
+        let caret_y_phys = caret_top_logical * s_f;
         let caret_w_phys = 2.0 * s_f;
-        let caret_h_phys = (FONT_INPUT + 4.0) * s_f;
+        let caret_h_phys = caret_h_logical * s_f;
         let mut caret = Paint::default();
         caret.set_color_rgba8(176, 128, 255, 255);
         if let Some(rect) =

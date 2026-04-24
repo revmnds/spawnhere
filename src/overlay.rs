@@ -1,4 +1,5 @@
 use crate::apps::{self, App, IconCache};
+use crate::config::EffectiveMode;
 use crate::history::History;
 use crate::picker::{self, PickerState, TextRenderer};
 use crate::stroke::{Bbox, Stroke};
@@ -58,6 +59,7 @@ pub struct RunConfig {
     pub preset_exec: Option<String>,
     pub padding: u32,
     pub history: History,
+    pub gesture: crate::config::GestureConfig,
 }
 
 /// Caret blink half-period (ms). Standard system blink is ~530ms per half cycle.
@@ -134,16 +136,35 @@ struct AppState {
     drawing: bool,
     has_drawn: bool,
     stroke: Stroke,
-    /// Live shift-modifier state. When true during the press/drag, the stroke
-    /// is replaced with a clean rectangle from press point to current cursor
-    /// instead of capturing freehand points.
+    /// Live Shift modifier. With the default config (`Shift` = square) this
+    /// constrains the rectangle to 1:1; users can remap it via config.
     shift_held: bool,
-    /// Live Ctrl modifier — used by Ctrl+P in the picker to pin the selected
-    /// app as the default (for `spawnhere --default`).
+    /// Live Ctrl modifier. Used for two orthogonal things: (a) Ctrl+P in the
+    /// picker pins the selected app as the `--default` target, and (b) with
+    /// the default config (`Ctrl` = freehand) it switches the drag to freehand
+    /// mode. At release time, a held Ctrl also escapes from an active
+    /// `--default` preset so the picker opens for this spawn — see the
+    /// long-form note in the release handler below.
     ctrl_held: bool,
-    /// Press-point of a rectangle drag. `Some` while `drawing && shift_held`
-    /// (and set at press time), `None` in freehand mode.
+    /// Live Alt modifier. Unused in the default config but reserved: users can
+    /// remap `square_modifier` or `freehand_modifier` to `"alt"`.
+    alt_held: bool,
+    /// Press-point of a rectangle-style drag (plain rectangle or Shift-square).
+    /// `Some` while the current drag is in rectangle mode, `None` for freehand.
+    /// Set when the drag threshold is crossed, not at press time, so a click
+    /// never leaves stale state behind.
     rect_start: Option<(f32, f32)>,
+    /// Press-point of the current gesture. Recorded on mouse-down; compared
+    /// against every subsequent motion to decide whether the user has actually
+    /// started dragging. Cleared on release.
+    drag_origin: Option<(f32, f32)>,
+    /// `true` once the cursor has travelled more than `gesture.drag_threshold_px`
+    /// from `drag_origin`. While `false`, the stroke stays empty so a
+    /// micro-jittered click doesn't spawn a sliver window.
+    drag_committed: bool,
+    /// User-tunable gesture behaviour: which mode is default, which modifiers
+    /// select the others, minimum drag distance, dimension readout toggle.
+    gesture_cfg: crate::config::GestureConfig,
 
     phase: Phase,
     preset_exec: Option<String>,
@@ -174,7 +195,7 @@ struct AppState {
 }
 
 pub fn run(cfg: RunConfig) -> Result<Outcome> {
-    let RunConfig { preset_exec, padding, history } = cfg;
+    let RunConfig { preset_exec, padding, history, gesture } = cfg;
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initializing Wayland registry")?;
@@ -281,13 +302,17 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         stroke: Stroke::new(),
         shift_held: false,
         ctrl_held: false,
+        alt_held: false,
         rect_start: None,
+        drag_origin: None,
+        drag_committed: false,
+        gesture_cfg: gesture,
 
         phase: Phase::Drawing,
         preset_exec,
         picker: PickerState::new(history),
         text: TextRenderer::new(),
-        icons: IconCache::new(24),
+        icons: IconCache::new(crate::picker::ICON_SIZE),
         apps_rx,
         last_card: None,
 
@@ -360,11 +385,29 @@ impl AppState {
     /// straight edges fall out as the connecting `line_to`s between arc
     /// endpoints. The radius is subtle (8 logical px) and clamps to half the
     /// smaller side so tiny rects don't become circles.
-    fn update_rect_stroke(&mut self, cx: f32, cy: f32) {
+    ///
+    /// When `square` is true, the stroke is constrained to a 1:1 aspect ratio
+    /// anchored at `rect_start`. The short leg of the drag wins so the cursor
+    /// only pulls the opposite corner along the diagonal — matches the
+    /// Photoshop/Figma behaviour of Shift-constraining a rectangle tool.
+    fn update_rect_stroke(&mut self, cx: f32, cy: f32, square: bool) {
         let Some((sx, sy)) = self.rect_start else { return };
         self.stroke.clear();
-        let (x0, x1) = (sx.min(cx), sx.max(cx));
-        let (y0, y1) = (sy.min(cy), sy.max(cy));
+
+        let (x0, x1, y0, y1) = if square {
+            // Cursor direction drives which diagonal we collapse onto. The
+            // drag distance on the shorter axis caps the box so a 1:1 always
+            // fits inside the user's gesture.
+            let dx = cx - sx;
+            let dy = cy - sy;
+            let side = dx.abs().min(dy.abs());
+            let ex = sx + side * dx.signum();
+            let ey = sy + side * dy.signum();
+            (sx.min(ex), sx.max(ex), sy.min(ey), sy.max(ey))
+        } else {
+            (sx.min(cx), sx.max(cx), sy.min(cy), sy.max(cy))
+        };
+
         let w = x1 - x0;
         let h = y1 - y0;
         let r = 8.0_f32.min(w * 0.5).min(h * 0.5);
@@ -384,6 +427,52 @@ impl AppState {
         // Close: back to the start of the top-right arc so the top edge
         // renders as the final line_to segment.
         self.stroke.push(x1 - r, y0);
+    }
+
+    /// Drive the stroke forward from a motion event. Handles three cases:
+    ///   1. Haven't crossed the drag threshold yet → no-op (stroke stays
+    ///      empty; a release here counts as a click).
+    ///   2. Just crossed the threshold → initialise the stroke in whichever
+    ///      effective mode the current modifiers select.
+    ///   3. Already committed → extend the existing stroke.
+    fn commit_or_extend_drag(&mut self, x: f32, y: f32) {
+        if !self.drag_committed {
+            let Some((ox, oy)) = self.drag_origin else { return };
+            let dx = x - ox;
+            let dy = y - oy;
+            if (dx * dx + dy * dy).sqrt() < self.gesture_cfg.drag_threshold_px {
+                return;
+            }
+            self.drag_committed = true;
+            self.stroke.clear();
+            match self.effective_mode() {
+                EffectiveMode::Rectangle => {
+                    self.rect_start = Some((ox, oy));
+                    self.update_rect_stroke(x, y, false);
+                }
+                EffectiveMode::Square => {
+                    self.rect_start = Some((ox, oy));
+                    self.update_rect_stroke(x, y, true);
+                }
+                EffectiveMode::Freehand => {
+                    self.rect_start = None;
+                    self.stroke.push(ox, oy);
+                    self.stroke.push(x, y);
+                }
+            }
+            return;
+        }
+
+        match self.effective_mode() {
+            EffectiveMode::Rectangle => self.update_rect_stroke(x, y, false),
+            EffectiveMode::Square => self.update_rect_stroke(x, y, true),
+            EffectiveMode::Freehand => self.stroke.push(x, y),
+        }
+    }
+
+    fn effective_mode(&self) -> EffectiveMode {
+        self.gesture_cfg
+            .resolve(self.shift_held, self.ctrl_held, self.alt_held)
     }
 
     fn enter_picker_phase(&mut self) {
@@ -534,9 +623,62 @@ impl AppState {
         let anim_t = self.stroke_anim_start.elapsed().as_secs_f32();
         draw_stroke(pixmap, &self.stroke, stroke_alpha, scale, anim_t, shimmer_on);
 
-        if self.phase == Phase::Drawing && !self.drawing && !self.has_drawn {
-            if let Some((cx, cy)) = self.cursor {
-                draw_crosshair(pixmap, cx, cy, scale);
+        // Crosshair visibility:
+        //   * Idle (not yet drawing) — always show, so the user has a clear
+        //     "aim point" before they commit to a gesture.
+        //   * Mid-rectangle-drag — keep it on the far corner so there's still
+        //     something tracking the cursor (the rect outline is fixed-width
+        //     and easy to lose). Skipped for freehand since the stroke itself
+        //     is already a continuous cursor-follower.
+        if self.phase == Phase::Drawing {
+            let show_crosshair = match (self.drawing, self.has_drawn, self.drag_committed) {
+                (false, false, _) => true,
+                (true, _, true) => {
+                    let mode = self.gesture_cfg.resolve(
+                        self.shift_held,
+                        self.ctrl_held,
+                        self.alt_held,
+                    );
+                    matches!(mode, EffectiveMode::Rectangle | EffectiveMode::Square)
+                }
+                (true, _, false) => true, // pre-threshold — still aiming
+                _ => false,
+            };
+            if show_crosshair {
+                if let Some((cx, cy)) = self.cursor {
+                    draw_crosshair(pixmap, cx, cy, scale);
+                }
+            }
+        }
+
+        // Live W×H readout next to the cursor while drawing a rectangle. Only
+        // shown after the drag threshold is crossed — before that the bbox is
+        // zero-size and the number would flicker meaninglessly.
+        if self.phase == Phase::Drawing
+            && self.drawing
+            && self.drag_committed
+            && self.gesture_cfg.show_dimensions
+        {
+            // Resolve via field borrow instead of `&self` method borrow —
+            // `canvas` is still alive from the buffer allocation above, so a
+            // whole-`self` borrow here trips the borrow checker.
+            let mode = self.gesture_cfg.resolve(self.shift_held, self.ctrl_held, self.alt_held);
+            if matches!(mode, EffectiveMode::Rectangle | EffectiveMode::Square) {
+                if let Some((cx, cy)) = self.cursor {
+                    let bbox = self.stroke.bbox(0);
+                    draw_dimensions_readout(
+                        pixmap,
+                        &mut self.text,
+                        cx,
+                        cy,
+                        bbox.w,
+                        bbox.h,
+                        mode == EffectiveMode::Square,
+                        w_log,
+                        h_log,
+                        scale,
+                    );
+                }
             }
         }
 
@@ -546,7 +688,7 @@ impl AppState {
         if self.phase == Phase::Drawing {
             if let Some(preset) = self.preset_exec.clone() {
                 let display = preset.split_whitespace().next().unwrap_or(&preset).to_string();
-                draw_default_banner(pixmap, &mut self.text, w_log, &display, scale);
+                draw_default_banner(pixmap, &mut self.text, w_log, &display, scale, self.ctrl_held);
             }
         }
 
@@ -831,6 +973,7 @@ fn draw_default_banner(
     overlay_w: u32,
     preset: &str,
     scale: u32,
+    ctrl_held: bool,
 ) {
     let s = scale as f32;
     let s_i = scale as i32;
@@ -845,28 +988,119 @@ fn draw_default_banner(
     let pad_x = 16;
     let banner_w = text_w_log + 2 * pad_x;
     let banner_x = (overlay_w as i32 - banner_w) / 2;
-    // Sits below most top bars (~63 px on common Quickshell setups). If a
-    // user has a thicker bar the banner gets clipped — but at 80 px it's
-    // still visible to the vast majority and doesn't compete with the
-    // typical "draw in the middle of the screen" gesture.
     let banner_y = 80;
 
+    // Ctrl-held lights the pill up in the same vaporwave magenta as the rest
+    // of the picker affordances — visual confirmation that the next release
+    // will escape to the picker instead of launching the pinned app.
+    let (bg_rgba, border_rgba, stroke_w, text_rgba) = if ctrl_held {
+        (
+            (52, 36, 78, 240),
+            (210, 160, 255, 230),
+            1.6_f32,
+            (250, 248, 255, 255),
+        )
+    } else {
+        (
+            (20, 21, 30, 230),
+            (170, 100, 255, 130),
+            1.0_f32,
+            (235, 230, 245, 255),
+        )
+    };
+
     let mut bg = Paint::default();
-    bg.set_color_rgba8(20, 21, 30, 230);
+    bg.set_color_rgba8(bg_rgba.0, bg_rgba.1, bg_rgba.2, bg_rgba.3);
     bg.anti_alias = true;
     if let Some(path) = pill_path(banner_x as f32, banner_y as f32, banner_w as f32, banner_h as f32, 16.0) {
         pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
         let mut border = Paint::default();
-        border.set_color_rgba8(170, 100, 255, 130);
+        border.set_color_rgba8(border_rgba.0, border_rgba.1, border_rgba.2, border_rgba.3);
+        border.anti_alias = true;
+        let stroke = SkStroke { width: stroke_w, ..Default::default() };
+        pixmap.stroke_path(&path, &border, &stroke, t, None);
+    }
+
+    // Same centering formula as the search bar: cap-center ≈ 0.44·size below
+    // the draw origin, so putting the draw origin at (center − 0.44·size)
+    // lands the cap-center on the pill center.
+    let text_y = banner_y + banner_h / 2 - (font_size * 0.44) as i32;
+    text.draw_weighted(
+        pixmap,
+        (banner_x + pad_x) * s_i,
+        text_y * s_i,
+        &body,
+        font_size * s,
+        text_w_phys + 2.0 * s,
+        (text_rgba.0, text_rgba.1, text_rgba.2, text_rgba.3),
+        Weight::MEDIUM,
+    );
+}
+
+/// Draw a small `W×H` pill near the cursor while dragging a rectangle. Flips
+/// to the opposite side of the cursor when it would fall off the overlay so
+/// users near the screen edge still see the number.
+#[allow(clippy::too_many_arguments)]
+fn draw_dimensions_readout(
+    pixmap: &mut Pixmap,
+    text: &mut TextRenderer,
+    cursor_x: f32,
+    cursor_y: f32,
+    w_px: u32,
+    h_px: u32,
+    square: bool,
+    overlay_w: u32,
+    overlay_h: u32,
+    scale: u32,
+) {
+    let s = scale as f32;
+    let s_i = scale as i32;
+    let t = Transform::from_scale(s, s);
+
+    let font_size = 12.0_f32;
+    let body = if square {
+        format!("{w_px}×{h_px}  ·  1:1")
+    } else {
+        format!("{w_px}×{h_px}")
+    };
+    let text_w_phys = text.measure_width_weighted(&body, font_size * s, Weight::MEDIUM);
+    let text_w_log = (text_w_phys / s).ceil() as i32;
+
+    let pad_x = 8;
+    let pill_h = 22;
+    let pill_w = text_w_log + 2 * pad_x;
+
+    // Default placement: 14 px down-right of the cursor. Flip horizontally if
+    // we'd run past the right edge, vertically if we'd run past the bottom.
+    let gap = 14;
+    let mut pill_x = cursor_x as i32 + gap;
+    let mut pill_y = cursor_y as i32 + gap;
+    if pill_x + pill_w > overlay_w as i32 {
+        pill_x = cursor_x as i32 - gap - pill_w;
+    }
+    if pill_y + pill_h > overlay_h as i32 {
+        pill_y = cursor_y as i32 - gap - pill_h;
+    }
+    // Clamp so a cursor in the far corners still keeps the pill on screen.
+    pill_x = pill_x.max(4).min(overlay_w as i32 - pill_w - 4);
+    pill_y = pill_y.max(4).min(overlay_h as i32 - pill_h - 4);
+
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(20, 21, 30, 220);
+    bg.anti_alias = true;
+    if let Some(path) = pill_path(pill_x as f32, pill_y as f32, pill_w as f32, pill_h as f32, 11.0) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
+        let mut border = Paint::default();
+        border.set_color_rgba8(170, 100, 255, 160);
         border.anti_alias = true;
         let stroke = SkStroke { width: 1.0, ..Default::default() };
         pixmap.stroke_path(&path, &border, &stroke, t, None);
     }
 
-    let text_y = banner_y + (banner_h - font_size as i32) / 2 - 1;
+    let text_y = pill_y + (pill_h - font_size as i32) / 2 - 1;
     text.draw_weighted(
         pixmap,
-        (banner_x + pad_x) * s_i,
+        (pill_x + pad_x) * s_i,
         text_y * s_i,
         &body,
         font_size * s,
@@ -929,7 +1163,7 @@ impl CompositorHandler for AppState {
         self.scale = factor;
         surface.set_buffer_scale(factor);
         // Icons are baked at a fixed physical size; rebuild for the new scale.
-        self.icons = IconCache::new(24 * factor as u32);
+        self.icons = IconCache::new(crate::picker::ICON_SIZE * factor as u32);
         // Invalidate the pixmap — next draw reallocates at the new physical size.
         self.pixmap = None;
         self.needs_redraw = true;
@@ -1045,13 +1279,10 @@ impl PointerHandler for AppState {
                 }
                 PointerEventKind::Motion { .. } => {
                     let (x, y) = ev.position;
-                    self.cursor = Some((x as f32, y as f32));
+                    let (xf, yf) = (x as f32, y as f32);
+                    self.cursor = Some((xf, yf));
                     if self.phase == Phase::Drawing && self.drawing {
-                        if self.rect_start.is_some() {
-                            self.update_rect_stroke(x as f32, y as f32);
-                        } else {
-                            self.stroke.push(x as f32, y as f32);
-                        }
+                        self.commit_or_extend_drag(xf, yf);
                     }
                     self.needs_redraw = true;
                 }
@@ -1062,16 +1293,16 @@ impl PointerHandler for AppState {
                         let (x, y) = ev.position;
                         let (xf, yf) = (x as f32, y as f32);
                         self.stroke.clear();
+                        self.rect_start = None;
+                        // Don't commit to a gesture yet — wait for the cursor
+                        // to clear `drag_threshold_px`. A release before that
+                        // is treated as a click (natural-size spawn) instead
+                        // of a zero-size rect.
+                        self.drag_origin = Some((xf, yf));
+                        self.drag_committed = false;
                         // Restart the shimmer phase so the pulse begins at the
                         // stroke origin every time the user picks up the pen.
                         self.stroke_anim_start = Instant::now();
-                        if self.shift_held {
-                            self.rect_start = Some((xf, yf));
-                            self.update_rect_stroke(xf, yf);
-                        } else {
-                            self.rect_start = None;
-                            self.stroke.push(xf, yf);
-                        }
                         self.needs_redraw = true;
                     }
                     (Phase::Drawing, BTN_RIGHT) => {
@@ -1111,15 +1342,33 @@ impl PointerHandler for AppState {
                     if self.phase == Phase::Drawing && button == BTN_LEFT && self.drawing {
                         self.drawing = false;
                         self.rect_start = None;
-                        // Live-escape from --default: if the user was holding
-                        // Ctrl while drawing, they want the picker for this
-                        // spawn instead of the pinned app. Clearing the
-                        // preset makes enter_picker_phase fall through to the
-                        // picker instead of spawning directly. We use Ctrl
-                        // (not Shift) because Shift is already overloaded for
-                        // rectangle-mode drawing — sharing it would silently
-                        // cancel the pinned app every time the user drew a
-                        // rectangle.
+                        // Click (no drag committed): seed the stroke with a
+                        // single point at the press location so `bbox()`
+                        // returns a zero-size rect positioned *at the click*,
+                        // not (0, 0). Downstream still detects the click via
+                        // `bbox.w == 0 && bbox.h == 0`, and now the caller
+                        // has a usable centre point for spawning.
+                        if !self.drag_committed {
+                            self.stroke.clear();
+                            if let Some((ox, oy)) = self.drag_origin {
+                                self.stroke.push(ox, oy);
+                            }
+                        }
+                        self.drag_origin = None;
+                        self.drag_committed = false;
+                        // Live-escape from --default: if Ctrl was held at
+                        // release, the user wants the picker for this spawn
+                        // instead of the pinned app. Clearing the preset makes
+                        // enter_picker_phase fall through to the picker
+                        // instead of spawning directly.
+                        //
+                        // Ctrl+drag now *also* draws freehand (see config
+                        // `freehand_modifier`). The two behaviours don't
+                        // collide because they live on different events:
+                        // motion drives the stroke, release drives the
+                        // preset-escape. The combined semantics are
+                        // coherent — "I want to deviate from the happy path,
+                        // both in shape and in target app."
                         //
                         // The apps list wasn't preloaded (we skipped the
                         // background scan assuming we wouldn't need it), so
@@ -1211,20 +1460,50 @@ impl KeyboardHandler for AppState {
         modifiers: Modifiers,
         _: u32,
     ) {
+        let prev_ctrl = self.ctrl_held;
         self.shift_held = modifiers.shift;
         self.ctrl_held = modifiers.ctrl;
-        // If the user pressed/released Shift mid-drag, snap the stroke to
-        // the corresponding mode immediately.
-        if self.phase == Phase::Drawing && self.drawing {
-            if self.shift_held && self.rect_start.is_none() {
-                if let Some((cx, cy)) = self.cursor {
-                    self.rect_start = Some((cx, cy));
-                    self.update_rect_stroke(cx, cy);
+        self.alt_held = modifiers.alt;
+
+        // The default-mode banner lights up while Ctrl is held (signals the
+        // next release will escape to the picker). Refresh even when the user
+        // isn't dragging so the visual feedback tracks the key state live.
+        if self.phase == Phase::Drawing
+            && self.preset_exec.is_some()
+            && prev_ctrl != self.ctrl_held
+        {
+            self.needs_redraw = true;
+        }
+
+        // If a modifier changes mid-drag, re-resolve the effective mode and
+        // reshape the stroke on the fly. We keep the drag origin as the
+        // anchor so transitioning between rect/square/freehand feels
+        // continuous instead of restarting the gesture.
+        if self.phase == Phase::Drawing && self.drawing && self.drag_committed {
+            let Some((cx, cy)) = self.cursor else { return };
+            let mode = self.effective_mode();
+            match mode {
+                EffectiveMode::Rectangle | EffectiveMode::Square => {
+                    let square = mode == EffectiveMode::Square;
+                    if self.rect_start.is_none() {
+                        // Coming from freehand: anchor at the drag origin so
+                        // the new rect spans the full gesture, not just from
+                        // the point where the modifier changed.
+                        let anchor = self.drag_origin.unwrap_or((cx, cy));
+                        self.rect_start = Some(anchor);
+                    }
+                    self.update_rect_stroke(cx, cy, square);
                 }
-            } else if !self.shift_held && self.rect_start.is_some() {
-                self.rect_start = None;
-                self.stroke.clear();
-                if let Some((cx, cy)) = self.cursor {
+                EffectiveMode::Freehand => {
+                    // Going into freehand mid-drag: drop whatever shape we
+                    // had and start a fresh stroke at the cursor. Seeding it
+                    // with `drag_origin` drew a connecting line between the
+                    // two points and made the transition feel like the
+                    // gesture teleported — clearing and starting at the
+                    // cursor matches what the user expects when they
+                    // "switch tools" mid-gesture.
+                    self.rect_start = None;
+                    self.stroke.clear();
                     self.stroke.push(cx, cy);
                 }
             }

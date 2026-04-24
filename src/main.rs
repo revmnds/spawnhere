@@ -14,6 +14,7 @@ mod stroke;
 
 use history::History;
 use pinned::Pinned;
+use stroke::Bbox;
 
 #[derive(Parser)]
 #[command(name = "spawnhere", version, about = "Draw a gesture to spawn a floating window")]
@@ -66,6 +67,7 @@ fn main() -> Result<()> {
         preset_exec,
         padding: cli.padding,
         history: History::load(),
+        gesture: cfg.gesture.clone(),
     })
     .context("overlay failed")?;
 
@@ -80,11 +82,32 @@ fn main() -> Result<()> {
     // `move X Y` is reserved-area-unaware. Falls back to the overlay's full
     // rect if hyprctl is unreachable.
     //
-    // Per-app TOML rules (min_width / cell_px) only apply when the user
-    // actually drew a rectangle. A bare click means "spawn here at the app's
-    // natural size" — we don't override that with a rule, since that would
-    // make every click expand into the rule's footprint.
+    // Size resolution order:
+    //   1. Drag → enforce `gesture.min_width/min_height` as a global floor
+    //      (so a tiny drag can't produce a sliver window), then apply any
+    //      matching `[rules.<class>]` on top (per-app floors / cell snap).
+    //   2. Click (bbox.w == 0) with `gesture.click_spawn_*` set → centre a
+    //      window of that size on the click point. Feels right for quick
+    //      "drop a floating window here" usage without forcing the user to
+    //      physically draw every time.
+    //   3. Click with no click-spawn size configured → legacy behaviour:
+    //      let the app open at its natural size at the click point.
     let safe = hyprland::focused_monitor_safe_area().unwrap_or(screen);
+    let bbox = if bbox.w > 0 && bbox.h > 0 {
+        bbox.enforce_min(cfg.gesture.min_width, cfg.gesture.min_height)
+    } else if let (Some(cw), Some(ch)) =
+        (cfg.gesture.click_spawn_width, cfg.gesture.click_spawn_height)
+    {
+        // bbox.x/y came from the single-point click; centre a cw×ch rect on it.
+        Bbox {
+            x: bbox.x - (cw as i32) / 2,
+            y: bbox.y - (ch as i32) / 2,
+            w: cw,
+            h: ch,
+        }
+    } else {
+        bbox
+    };
     let bbox = if bbox.w > 0 && bbox.h > 0 {
         config::apply_rule(bbox, cfg.rule_for(&exec)).clamp_to_rect(safe)
     } else {

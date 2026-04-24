@@ -9,7 +9,7 @@ use nucleo_matcher::{
 mod render;
 pub mod text;
 
-pub use render::{draw, CardRect};
+pub use render::{draw, CardRect, ICON_SIZE};
 pub use text::TextRenderer;
 
 pub const VISIBLE_ITEMS: usize = 8;

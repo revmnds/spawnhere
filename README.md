@@ -42,15 +42,18 @@ Reload (`hyprctl reload`). Press `Super+` `` ` `` → draw → release → pick 
 
 ## How it works
 
-Three gestures, one bind:
+Four gestures, one bind:
 
 | Gesture | Result |
 |---|---|
-| **Drag** any shape | Window spawns at the *bounding box* of what you drew. Freehand anything — a circle, a squiggle, the letter R — the bbox is the spawn zone. |
-| **Shift + drag** | Clean rounded rectangle, useful when you want a specific aspect ratio. |
-| **Click without dragging** | App opens at its *natural* size, centered on the click. |
+| **Drag** | Clean rounded rectangle. Dimensions float next to the cursor as you size it. Default mode — matches the Photoshop/Figma muscle memory. |
+| **Shift + drag** | Same rectangle, constrained to a **1:1 square**. |
+| **Alt + drag** | *Freehand* — draw whatever you like (a circle, a squiggle, the letter R) and the window spawns at the bounding box of your stroke. |
+| **Click without dragging** | Opens a window centered on the click at the configured `click_spawn_*` size (default 720×480). A micro-jitter under 5 px still counts as a click. |
 
 Release → a fuzzy picker appears inside your drawing. Type, `↵`, done.
+
+> **Coming from an older spawnhere?** The default used to be freehand. If you prefer it that way, flip it in `config.toml` under `[gesture]` — see the [Config](#config) section.
 
 <details>
 <summary><b>Picker shortcuts</b></summary>
@@ -101,6 +104,17 @@ cell_px = [10, 22]             # snap terminal bboxes to the cell grid
 [rules.firefox]
 min_width = 1200
 min_height = 800
+
+[gesture]
+default             = "rectangle"  # or "freehand" to restore the old default
+square_modifier     = "shift"      # held modifier that forces 1:1
+freehand_modifier   = "alt"        # held modifier that switches to freehand
+drag_threshold_px   = 5.0          # below this, a drag is treated as a click
+show_dimensions     = true         # W×H readout near the cursor while dragging
+min_width           = 320          # global floor for any drawn bbox
+min_height          = 200
+click_spawn_width   = 720          # size used for click-to-spawn (no drag)
+click_spawn_height  = 480          # set either to 0/omit for natural size
 ```
 
 Rules match on the first path component of the chosen exec

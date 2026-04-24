@@ -43,11 +43,14 @@ impl TextRenderer {
         Self { font, cache: HashMap::new() }
     }
 
-    fn ascent(&self, size: f32) -> f32 {
-        self.font
-            .horizontal_line_metrics(size)
-            .map(|m| m.ascent)
-            .unwrap_or(size * 0.8)
+    /// Baseline offset from the caller's `y`. We use a line-height:1.0
+    /// convention (baseline ≈ 0.8 × size) rather than the font's full
+    /// typographic ascent (~0.97 × size for Inter). The layout code all over
+    /// the picker is tuned against the shorter baseline — matching cosmic-text's
+    /// default buffer metrics — so using the raw ascent drops every text 2-3 px
+    /// below the visual center of its row.
+    fn baseline_offset(&self, size: f32) -> f32 {
+        size * 0.8
     }
 
     fn glyph(&mut self, ch: char, size: f32) -> &CachedGlyph {
@@ -121,8 +124,7 @@ impl TextRenderer {
         if text.is_empty() {
             return;
         }
-        let ascent = self.ascent(size);
-        let baseline_y = y as f32 + ascent;
+        let baseline_y = y as f32 + self.baseline_offset(size);
         let stop_at = x as f32 + max_width;
 
         // Collect glyph plan first so we can drop the &mut borrow on the cache
