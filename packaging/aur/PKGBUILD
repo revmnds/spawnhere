@@ -10,8 +10,6 @@ depends=(
   'hyprland'
   'wayland'
   'libxkbcommon'
-  'fontconfig'
-  'freetype2'
 )
 makedepends=(
   'cargo'
