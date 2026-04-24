@@ -10,8 +10,6 @@ pkgbase = spawnhere
 	depends = hyprland
 	depends = wayland
 	depends = libxkbcommon
-	depends = fontconfig
-	depends = freetype2
 	source = spawnhere-0.1.0.tar.gz::https://github.com/revmnds/spawnhere/archive/refs/tags/v0.1.0.tar.gz
 	sha256sums = 11313afedf7654d830ee61de5cc18cff65a5d2fc621cbc6977934c70f7fcf490
 
