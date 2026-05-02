@@ -36,6 +36,8 @@ bind = SUPER SHIFT, grave, exec, spawnhere             # picker
 
 Reload with `hyprctl reload`, press the bind, drag a rectangle, pick an app. Hold `Shift` for a 1:1 square, `Alt` for freehand, or click without dragging to spawn at default size.
 
+The cursor magnetises to the corners and edges of windows already on screen so new spawns line up cleanly. Press `S` while drawing to toggle snap.
+
 See `spawnhere --help` for all flags.
 
 ## Config
