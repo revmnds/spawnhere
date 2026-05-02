@@ -76,6 +76,13 @@ min_height = 700
 # `click_spawn_width` / `click_spawn_height` control what a click-without-drag
 # spawns as: a window of that size centred on the click. Omit either (or set
 # to 0) to fall back to "app's natural size at the click point".
+#
+# `snap` magnetises the cursor / dragged corner onto the corners and edges of
+# windows already on the focused monitor (and the safe-area edges). Vertical
+# magenta and horizontal cyan dashed guides extend across the screen when an
+# axis is locked, Figma-style. Set `snap = false` for plain free-cursor
+# behaviour. `snap_radius_px` is how close the cursor has to get before the
+# pull engages — larger = stickier; 12 is a comfortable default.
 
 [gesture]
 default            = "rectangle"
@@ -87,3 +94,5 @@ min_width          = 320
 min_height         = 200
 click_spawn_width  = 720
 click_spawn_height = 480
+snap               = true
+snap_radius_px     = 12.0

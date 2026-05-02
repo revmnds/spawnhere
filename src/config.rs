@@ -70,6 +70,12 @@ pub struct GestureConfig {
     /// footprint instead of whatever the app's default window size is.
     pub click_spawn_width: Option<u32>,
     pub click_spawn_height: Option<u32>,
+    /// Snap the cursor / dragged corner to the corners and edges of windows
+    /// already on the focused monitor (and the safe-area edges). Disable to
+    /// restore plain free-cursor behaviour.
+    pub snap: bool,
+    /// Pull radius in logical pixels. Larger = stickier. 0 disables snap.
+    pub snap_radius_px: f32,
 }
 
 impl Default for GestureConfig {
@@ -89,6 +95,8 @@ impl Default for GestureConfig {
             min_height: 200,
             click_spawn_width: Some(720),
             click_spawn_height: Some(480),
+            snap: true,
+            snap_radius_px: 12.0,
         }
     }
 }
@@ -266,6 +274,8 @@ mod tests {
         assert_eq!(g.min_height, 200);
         assert_eq!(g.click_spawn_width, Some(720));
         assert_eq!(g.click_spawn_height, Some(480));
+        assert!(g.snap);
+        assert_eq!(g.snap_radius_px, 12.0);
     }
 
     #[test]
