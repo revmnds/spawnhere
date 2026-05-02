@@ -9,7 +9,7 @@ A launcher for Hyprland: sketch a rectangle on screen, pick an app, and it spawn
 [![AUR](https://img.shields.io/aur/version/spawnhere?color=1793d1&label=AUR&logo=arch-linux&logoColor=white)](https://aur.archlinux.org/packages/spawnhere)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-<video src="https://github.com/user-attachments/assets/c5826039-14b3-48ac-bdbe-5c7b68ab2be2" autoplay loop muted playsinline width="720"></video>
+<img src="assets/demo.gif" alt="spawnhere demo" width="720">
 
 </div>
 
