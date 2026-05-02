@@ -113,6 +113,11 @@ const SNAP_GUIDE_DASH_ON: f32 = 4.0;
 const SNAP_GUIDE_DASH_OFF: f32 = 4.0;
 const SNAP_GUIDE_STROKE: f32 = 1.0;
 
+/// Shared height for the top-centre info banners (default-mode + snap-toggle).
+/// Kept in one place so they stack cleanly with the same gap regardless of
+/// which one is being drawn.
+const BANNER_H: i32 = 32;
+
 #[derive(Clone, PartialEq)]
 enum Decision {
     Pending,
@@ -787,21 +792,39 @@ impl AppState {
             }
         }
 
-        // Default-mode hint: tells the user which app this bind launches and
-        // how to escape to the picker. Without it, a user who pinned by
-        // accident has no way to discover the secondary bind.
+        // Top-centre info zone. Shared layout for the default-mode banner
+        // and the snap toggle hint: both render as 32-px pills with the same
+        // typography and palette, stacked vertically when both are active so
+        // the user sees one consistent "info column" instead of affordances
+        // scattered around the overlay.
         if self.phase == Phase::Drawing {
+            let mut info_y: i32 = 80;
+            const INFO_GAP: i32 = 8;
+
             if let Some(preset) = self.preset_exec.clone() {
                 let display = preset.split_whitespace().next().unwrap_or(&preset).to_string();
-                draw_default_banner(pixmap, &mut self.text, w_log, &display, scale, self.ctrl_held);
+                draw_default_banner(
+                    pixmap,
+                    &mut self.text,
+                    w_log,
+                    &display,
+                    scale,
+                    self.ctrl_held,
+                    info_y,
+                );
+                info_y += BANNER_H + INFO_GAP;
             }
-        }
 
-        // Snap indicator (bottom-left). Only drawn when there are candidates
-        // to snap against — otherwise the toggle is a no-op and the hint
-        // would just be noise.
-        if self.phase == Phase::Drawing && self.snapper.is_some() {
-            draw_snap_indicator(pixmap, &mut self.text, h_log, self.snap_enabled, scale);
+            if self.snapper.is_some() {
+                draw_snap_banner(
+                    pixmap,
+                    &mut self.text,
+                    w_log,
+                    self.snap_enabled,
+                    scale,
+                    info_y,
+                );
+            }
         }
 
         if self.phase == Phase::Picking {
@@ -1079,6 +1102,7 @@ fn draw_stroke(
 /// Tells the user which app this bind will launch and how to switch to the
 /// picker without already knowing the secondary keybind. Ensures the pinning
 /// feature is escapable from a single-bind user's perspective.
+#[allow(clippy::too_many_arguments)]
 fn draw_default_banner(
     pixmap: &mut Pixmap,
     text: &mut TextRenderer,
@@ -1086,6 +1110,7 @@ fn draw_default_banner(
     preset: &str,
     scale: u32,
     ctrl_held: bool,
+    banner_y: i32,
 ) {
     let s = scale as f32;
     let s_i = scale as i32;
@@ -1096,11 +1121,10 @@ fn draw_default_banner(
     let text_w_phys = text.measure_width_weighted(&body, font_size * s, Weight::MEDIUM);
     let text_w_log = (text_w_phys / s).ceil() as i32;
 
-    let banner_h = 32;
+    let banner_h = BANNER_H;
     let pad_x = 16;
     let banner_w = text_w_log + 2 * pad_x;
     let banner_x = (overlay_w as i32 - banner_w) / 2;
-    let banner_y = 80;
 
     // Ctrl-held lights the pill up in the same vaporwave magenta as the rest
     // of the picker affordances — visual confirmation that the next release
@@ -1149,60 +1173,70 @@ fn draw_default_banner(
     );
 }
 
-/// Discreet bottom-left pill telling the user the current snap state and the
-/// toggle key. Always present (when there are candidates) so the shortcut is
-/// auto-discoverable on first run.
-fn draw_snap_indicator(
+/// Top-centre snap toggle banner. Mirrors `draw_default_banner` exactly in
+/// typography, height, padding, and palette so when both are visible they
+/// read as a single info column. Enabled = vaporwave-magenta accent (matches
+/// default banner's ctrl_held state), disabled = quiet base style.
+fn draw_snap_banner(
     pixmap: &mut Pixmap,
     text: &mut TextRenderer,
-    overlay_h: u32,
+    overlay_w: u32,
     enabled: bool,
     scale: u32,
+    banner_y: i32,
 ) {
     let s = scale as f32;
     let s_i = scale as i32;
     let t = Transform::from_scale(s, s);
 
-    let font_size = 12.0_f32;
+    let font_size = 13.0_f32;
     let body = if enabled {
-        "Snap: ON  ·  S to toggle".to_string()
+        "✦ Snap on   ·   Press S to disable".to_string()
     } else {
-        "Snap: off  ·  S to toggle".to_string()
+        "Snap off   ·   Press S to enable".to_string()
     };
     let text_w_phys = text.measure_width_weighted(&body, font_size * s, Weight::MEDIUM);
     let text_w_log = (text_w_phys / s).ceil() as i32;
 
-    let pill_h = 24;
-    let pad_x = 12;
-    let pill_w = text_w_log + 2 * pad_x;
-    let pill_x = 16;
-    let pill_y = overlay_h as i32 - pill_h - 16;
+    let banner_h = BANNER_H;
+    let pad_x = 16;
+    let banner_w = text_w_log + 2 * pad_x;
+    let banner_x = (overlay_w as i32 - banner_w) / 2;
 
-    // Color shift mirrors the default-banner: enabled glows in vaporwave
-    // magenta, disabled fades to a quiet grey so the user instantly sees
-    // which state they're in without reading the text.
-    let (bg_rgba, border_rgba, text_rgba) = if enabled {
-        ((20, 21, 30, 220), (170, 100, 255, 160), (235, 230, 245, 255))
+    // Same two-tone palette as the default banner: the "active accent" state
+    // for enabled (matches ctrl_held), the "resting base" state for disabled.
+    let (bg_rgba, border_rgba, stroke_w, text_rgba) = if enabled {
+        (
+            (52, 36, 78, 240),
+            (210, 160, 255, 230),
+            1.6_f32,
+            (250, 248, 255, 255),
+        )
     } else {
-        ((20, 21, 30, 180), (110, 110, 130, 130), (180, 178, 195, 255))
+        (
+            (20, 21, 30, 230),
+            (130, 130, 150, 130),
+            1.0_f32,
+            (200, 200, 215, 255),
+        )
     };
 
     let mut bg = Paint::default();
     bg.set_color_rgba8(bg_rgba.0, bg_rgba.1, bg_rgba.2, bg_rgba.3);
     bg.anti_alias = true;
-    if let Some(path) = pill_path(pill_x as f32, pill_y as f32, pill_w as f32, pill_h as f32, 12.0) {
+    if let Some(path) = pill_path(banner_x as f32, banner_y as f32, banner_w as f32, banner_h as f32, 16.0) {
         pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
         let mut border = Paint::default();
         border.set_color_rgba8(border_rgba.0, border_rgba.1, border_rgba.2, border_rgba.3);
         border.anti_alias = true;
-        let stroke = SkStroke { width: 1.0, ..Default::default() };
+        let stroke = SkStroke { width: stroke_w, ..Default::default() };
         pixmap.stroke_path(&path, &border, &stroke, t, None);
     }
 
-    let text_y = pill_y + pill_h / 2 - (font_size * 0.44) as i32;
+    let text_y = banner_y + banner_h / 2 - (font_size * 0.44) as i32;
     text.draw_weighted(
         pixmap,
-        (pill_x + pad_x) * s_i,
+        (banner_x + pad_x) * s_i,
         text_y * s_i,
         &body,
         font_size * s,
