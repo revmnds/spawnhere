@@ -55,6 +55,7 @@ min_height = 800
 default            = "rectangle"   # or "freehand"
 click_spawn_width  = 720
 click_spawn_height = 480
+snap               = true          # magnetise to existing windows
 ```
 
 Full reference: [`examples/config.toml`](examples/config.toml).
