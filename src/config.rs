@@ -91,8 +91,8 @@ impl Default for GestureConfig {
             freehand_modifier: Some(Modifier::Alt),
             drag_threshold_px: 5.0,
             show_dimensions: true,
-            min_width: 320,
-            min_height: 200,
+            min_width: 120,
+            min_height: 80,
             click_spawn_width: Some(720),
             click_spawn_height: Some(480),
             snap: true,
@@ -270,8 +270,8 @@ mod tests {
         assert_eq!(g.freehand_modifier, Some(Modifier::Alt));
         assert_eq!(g.drag_threshold_px, 5.0);
         assert!(g.show_dimensions);
-        assert_eq!(g.min_width, 320);
-        assert_eq!(g.min_height, 200);
+        assert_eq!(g.min_width, 120);
+        assert_eq!(g.min_height, 80);
         assert_eq!(g.click_spawn_width, Some(720));
         assert_eq!(g.click_spawn_height, Some(480));
         assert!(g.snap);
@@ -343,7 +343,7 @@ mod tests {
         // Other keys should still hold their defaults.
         assert_eq!(cfg.gesture.square_modifier, Some(Modifier::Shift));
         assert_eq!(cfg.gesture.drag_threshold_px, 5.0);
-        assert_eq!(cfg.gesture.min_width, 320);
+        assert_eq!(cfg.gesture.min_width, 120);
         assert_eq!(cfg.gesture.click_spawn_width, Some(720));
     }
 }
