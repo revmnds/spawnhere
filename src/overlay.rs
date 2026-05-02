@@ -2,6 +2,7 @@ use crate::apps::{self, App, IconCache};
 use crate::config::EffectiveMode;
 use crate::history::History;
 use crate::picker::{self, PickerState, TextRenderer};
+use crate::snap::{SnapResult, Snapper};
 use crate::stroke::{Bbox, Stroke};
 use anyhow::{Context, Result};
 use std::sync::mpsc::Receiver;
@@ -60,6 +61,14 @@ pub struct RunConfig {
     pub padding: u32,
     pub history: History,
     pub gesture: crate::config::GestureConfig,
+    /// Visible windows on the focused monitor, in monitor-local coords.
+    /// Empty disables snap (also empty when `gesture.snap == false`).
+    pub snap_windows: Vec<Bbox>,
+    /// Safe-area rect for the focused monitor in monitor-local coords. The
+    /// snapper uses its corners and edges as additional snap candidates so
+    /// new windows can be flushed against the screen edge / bars. Falls back
+    /// to the overlay's own rect if `None`.
+    pub snap_safe_area: Option<Bbox>,
 }
 
 /// Caret blink half-period (ms). Standard system blink is ~530ms per half cycle.
@@ -92,6 +101,17 @@ const PULSE_COLORS: &[(u8, u8, u8)] = &[
     (255, 60, 200),  // hot magenta
     (80, 230, 255),  // electric cyan
 ];
+
+/// Snap visuals — kept matching the existing vaporwave palette so the snap
+/// affordances feel native to the rest of the overlay.
+const SNAP_RING_COLOR: (u8, u8, u8, u8) = (80, 230, 255, 220);
+const SNAP_RING_RADIUS: f32 = 7.0;
+const SNAP_RING_STROKE: f32 = 1.5;
+const SNAP_GUIDE_X_COLOR: (u8, u8, u8, u8) = (255, 60, 200, 180);
+const SNAP_GUIDE_Y_COLOR: (u8, u8, u8, u8) = (80, 230, 255, 180);
+const SNAP_GUIDE_DASH_ON: f32 = 4.0;
+const SNAP_GUIDE_DASH_OFF: f32 = 4.0;
+const SNAP_GUIDE_STROKE: f32 = 1.0;
 
 #[derive(Clone, PartialEq)]
 enum Decision {
@@ -178,6 +198,13 @@ struct AppState {
     /// stroke begins so the pulse always starts at the beginning of the line.
     stroke_anim_start: Instant,
 
+    /// Snapper built once when the overlay opens. `None` when snap is
+    /// disabled in config or no candidates exist (no other windows visible).
+    snapper: Option<Snapper>,
+    /// Last snap evaluation, kept around so `draw` can render the ring +
+    /// guides without re-running the snap on every frame.
+    last_snap: SnapResult,
+
     /// Reset on every typing event so the caret stays solid for one half-cycle
     /// after input (matches standard text-input UX).
     caret_blink_reset: Instant,
@@ -195,7 +222,7 @@ struct AppState {
 }
 
 pub fn run(cfg: RunConfig) -> Result<Outcome> {
-    let RunConfig { preset_exec, padding, history, gesture } = cfg;
+    let RunConfig { preset_exec, padding, history, gesture, snap_windows, snap_safe_area } = cfg;
     let conn = Connection::connect_to_env().context("connecting to Wayland display")?;
     let (globals, event_queue) =
         registry_queue_init(&conn).context("initializing Wayland registry")?;
@@ -275,6 +302,24 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         })
         .map_err(|e| anyhow::anyhow!("inserting shimmer timer: {e}"))?;
 
+    // Build the snapper from pre-fetched data. If snap is disabled (radius
+    // zero) or there are no candidates AND no safe-area, leave it None so
+    // every snap call short-circuits to passthrough.
+    let snapper = if gesture.snap && gesture.snap_radius_px > 0.0 {
+        // Use a generous fallback safe area when hyprctl didn't report one.
+        // The configure event hasn't fired yet so we don't have width/height;
+        // an oversized fallback just means safe-area corners sit far off the
+        // overlay and never trigger snap, which is harmless.
+        let safe = snap_safe_area.unwrap_or(Bbox { x: 0, y: 0, w: 8000, h: 8000 });
+        if !snap_windows.is_empty() || snap_safe_area.is_some() {
+            Some(Snapper::new(&snap_windows, safe, gesture.snap_radius_px))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -315,6 +360,9 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
         icons: IconCache::new(crate::picker::ICON_SIZE),
         apps_rx,
         last_card: None,
+
+        snapper,
+        last_snap: SnapResult::passthrough((0.0, 0.0)),
 
         stroke_anim_start: Instant::now(),
         caret_blink_reset: Instant::now(),
@@ -470,6 +518,26 @@ impl AppState {
         }
     }
 
+    /// Snap a raw pointer position through the snapper (if any) and stash the
+    /// result for the renderer. Returns the (possibly snapped) point that
+    /// callers should use as if the cursor was actually there. Snap is
+    /// suppressed in the picker phase and during freehand drags — both cases
+    /// where alignment to other windows isn't meaningful.
+    fn apply_snap(&mut self, x: f32, y: f32) -> (f32, f32) {
+        let suppress = self.phase != Phase::Drawing
+            || matches!(self.effective_mode(), EffectiveMode::Freehand);
+        if suppress {
+            self.last_snap = SnapResult::passthrough((x, y));
+            return (x, y);
+        }
+        let result = match self.snapper.as_ref() {
+            Some(s) => s.snap((x, y)),
+            None => SnapResult::passthrough((x, y)),
+        };
+        self.last_snap = result;
+        result.point
+    }
+
     fn effective_mode(&self) -> EffectiveMode {
         self.gesture_cfg
             .resolve(self.shift_held, self.ctrl_held, self.alt_held)
@@ -622,6 +690,13 @@ impl AppState {
         let shimmer_on = self.phase == Phase::Drawing;
         let anim_t = self.stroke_anim_start.elapsed().as_secs_f32();
         draw_stroke(pixmap, &self.stroke, stroke_alpha, scale, anim_t, shimmer_on);
+
+        // Snap visuals: dashed alignment guides through the locked axis (or
+        // axes) and a small cyan ring at the snapped point. Drawn before the
+        // crosshair so the crosshair sits on top of the ring.
+        if self.phase == Phase::Drawing && self.last_snap.snapped() {
+            draw_snap_visuals(pixmap, &self.last_snap, w_log, h_log, scale);
+        }
 
         // Crosshair visibility:
         //   * Idle (not yet drawing) — always show, so the user has a clear
@@ -1125,6 +1200,100 @@ fn pill_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> 
     pb.finish()
 }
 
+fn draw_snap_visuals(
+    pixmap: &mut Pixmap,
+    snap: &SnapResult,
+    overlay_w: u32,
+    overlay_h: u32,
+    scale: u32,
+) {
+    let s = scale as f32;
+    let t = Transform::from_scale(s, s);
+
+    // Dashed pattern is constructed via tiny-skia's StrokeDash. The pattern
+    // values are in the path's coord system, so we don't pre-multiply by
+    // scale (the transform handles that).
+    let dash = tiny_skia::StrokeDash::new(
+        vec![SNAP_GUIDE_DASH_ON, SNAP_GUIDE_DASH_OFF],
+        0.0,
+    );
+
+    if let Some(gx) = snap.x_guide {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(
+            SNAP_GUIDE_X_COLOR.0,
+            SNAP_GUIDE_X_COLOR.1,
+            SNAP_GUIDE_X_COLOR.2,
+            SNAP_GUIDE_X_COLOR.3,
+        );
+        paint.anti_alias = true;
+        let stroke = SkStroke {
+            width: SNAP_GUIDE_STROKE * s,
+            line_cap: tiny_skia::LineCap::Butt,
+            dash: dash.clone(),
+            ..Default::default()
+        };
+        let mut pb = PathBuilder::new();
+        pb.move_to(gx, 0.0);
+        pb.line_to(gx, overlay_h as f32);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &paint, &stroke, t, None);
+        }
+    }
+
+    if let Some(gy) = snap.y_guide {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(
+            SNAP_GUIDE_Y_COLOR.0,
+            SNAP_GUIDE_Y_COLOR.1,
+            SNAP_GUIDE_Y_COLOR.2,
+            SNAP_GUIDE_Y_COLOR.3,
+        );
+        paint.anti_alias = true;
+        let stroke = SkStroke {
+            width: SNAP_GUIDE_STROKE * s,
+            line_cap: tiny_skia::LineCap::Butt,
+            dash: dash.clone(),
+            ..Default::default()
+        };
+        let mut pb = PathBuilder::new();
+        pb.move_to(0.0, gy);
+        pb.line_to(overlay_w as f32, gy);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &paint, &stroke, t, None);
+        }
+    }
+
+    // Snap ring at the locked point — drawn last so the dashed lines passing
+    // through it sit underneath the ring.
+    let (px, py) = snap.point;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(
+        SNAP_RING_COLOR.0,
+        SNAP_RING_COLOR.1,
+        SNAP_RING_COLOR.2,
+        SNAP_RING_COLOR.3,
+    );
+    paint.anti_alias = true;
+    let stroke = SkStroke {
+        width: SNAP_RING_STROKE * s,
+        ..Default::default()
+    };
+    let mut pb = PathBuilder::new();
+    // Approximate a circle with a path-builder cubic — tiny-skia doesn't
+    // expose `add_circle` on PathBuilder, so we use four cubic Beziers.
+    const K: f32 = 0.552_284_8; // 4*(sqrt(2)-1)/3 — magic Bezier circle constant
+    let r = SNAP_RING_RADIUS;
+    pb.move_to(px + r, py);
+    pb.cubic_to(px + r, py + r * K, px + r * K, py + r, px, py + r);
+    pb.cubic_to(px - r * K, py + r, px - r, py + r * K, px - r, py);
+    pb.cubic_to(px - r, py - r * K, px - r * K, py - r, px, py - r);
+    pb.cubic_to(px + r * K, py - r, px + r, py - r * K, px + r, py);
+    if let Some(path) = pb.finish() {
+        pixmap.stroke_path(&path, &paint, &stroke, t, None);
+    }
+}
+
 fn draw_crosshair(pixmap: &mut Pixmap, x: f32, y: f32, scale: u32) {
     let mut paint = Paint::default();
     paint.set_color_rgba8(255, 255, 255, 200);
@@ -1274,15 +1443,16 @@ impl PointerHandler for AppState {
                 PointerEventKind::Enter { serial } => {
                     self.apply_cursor_for_phase(pointer, serial);
                     let (x, y) = ev.position;
-                    self.cursor = Some((x as f32, y as f32));
+                    let (sx, sy) = self.apply_snap(x as f32, y as f32);
+                    self.cursor = Some((sx, sy));
                     self.needs_redraw = true;
                 }
                 PointerEventKind::Motion { .. } => {
                     let (x, y) = ev.position;
-                    let (xf, yf) = (x as f32, y as f32);
-                    self.cursor = Some((xf, yf));
+                    let (sx, sy) = self.apply_snap(x as f32, y as f32);
+                    self.cursor = Some((sx, sy));
                     if self.phase == Phase::Drawing && self.drawing {
-                        self.commit_or_extend_drag(xf, yf);
+                        self.commit_or_extend_drag(sx, sy);
                     }
                     self.needs_redraw = true;
                 }
@@ -1291,7 +1461,11 @@ impl PointerHandler for AppState {
                         self.drawing = true;
                         self.has_drawn = true;
                         let (x, y) = ev.position;
-                        let (xf, yf) = (x as f32, y as f32);
+                        // Anchor the press at the snapped position so the
+                        // gesture starts aligned with the candidate the user
+                        // sighted — both for click-to-spawn and drag origin.
+                        let (xf, yf) = self.apply_snap(x as f32, y as f32);
+                        self.cursor = Some((xf, yf));
                         self.stroke.clear();
                         self.rect_start = None;
                         // Don't commit to a gesture yet — wait for the cursor
@@ -1386,6 +1560,7 @@ impl PointerHandler for AppState {
                 }
                 PointerEventKind::Leave { .. } => {
                     self.cursor = None;
+                    self.last_snap = SnapResult::passthrough((0.0, 0.0));
                     self.needs_redraw = true;
                 }
                 PointerEventKind::Axis {
@@ -1481,6 +1656,13 @@ impl KeyboardHandler for AppState {
         // continuous instead of restarting the gesture.
         if self.phase == Phase::Drawing && self.drawing && self.drag_committed {
             let Some((cx, cy)) = self.cursor else { return };
+            // Re-snap through the new effective mode: switching out of freehand
+            // re-engages the snapper at the current cursor position; switching
+            // into freehand releases any active lock so the stroke starts at
+            // the raw point. apply_snap inspects the (now-updated) modifier
+            // state to make that decision.
+            let (cx, cy) = self.apply_snap(cx, cy);
+            self.cursor = Some((cx, cy));
             let mode = self.effective_mode();
             match mode {
                 EffectiveMode::Rectangle | EffectiveMode::Square => {

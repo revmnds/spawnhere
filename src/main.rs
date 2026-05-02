@@ -10,6 +10,7 @@ mod hyprland;
 mod overlay;
 mod picker;
 mod pinned;
+mod snap;
 mod stroke;
 
 use history::History;
@@ -63,11 +64,24 @@ fn main() -> Result<()> {
         cli.spawn.clone()
     };
 
+    // Pre-fetch the focused monitor's safe area + visible clients so the
+    // overlay has them ready when it builds the snapper. Both are best-effort
+    // — failures fall back to "no snap candidates", and the safe-area clamp
+    // below uses the post-spawn rect anyway.
+    let pre_safe = hyprland::focused_monitor_safe_area().ok();
+    let snap_windows = if cfg.gesture.snap && cfg.gesture.snap_radius_px > 0.0 {
+        hyprland::focused_monitor_clients().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let outcome = overlay::run(overlay::RunConfig {
         preset_exec,
         padding: cli.padding,
         history: History::load(),
         gesture: cfg.gesture.clone(),
+        snap_windows,
+        snap_safe_area: pre_safe,
     })
     .context("overlay failed")?;
 
