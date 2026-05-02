@@ -160,6 +160,75 @@ pub fn focused_monitor_safe_area() -> Result<Bbox> {
     })
 }
 
+/// Returns every visible window on the focused monitor's active workspace,
+/// each as a Bbox in **monitor-local** coords (matches the overlay's frame).
+/// Used by the snap-to-windows feature to know what to align against.
+///
+/// Filters: `mapped == true`, `hidden == false`, workspace ID matches the
+/// focused workspace of the focused monitor. Returns an empty vec on any
+/// hyprctl failure — snap should never crash the overlay.
+pub fn focused_monitor_clients() -> Result<Vec<Bbox>> {
+    let monitors = hyprctl_json(&["monitors", "-j"])?;
+    let mon = monitors
+        .as_array()
+        .and_then(|a| a.iter().find(|m| m["focused"].as_bool().unwrap_or(false)))
+        .context("no focused monitor reported by hyprctl")?;
+    let mname = mon["name"].as_str().context("monitor name missing")?.to_string();
+    let mx = mon["x"].as_i64().context("monitor x missing")? as i32;
+    let my = mon["y"].as_i64().context("monitor y missing")? as i32;
+    let active_ws = mon
+        .get("activeWorkspace")
+        .and_then(|w| w.get("id"))
+        .and_then(|v| v.as_i64());
+
+    let clients = hyprctl_json(&["clients", "-j"])?;
+    let arr = match clients.as_array() {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for c in arr {
+        if !c.get("mapped").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        if c.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        // Workspace must match the focused monitor's active workspace AND the
+        // client's monitor name (some Hyprland versions expose either field).
+        let ws_id = c
+            .get("workspace")
+            .and_then(|w| w.get("id"))
+            .and_then(|v| v.as_i64());
+        if let (Some(wanted), Some(got)) = (active_ws, ws_id) {
+            if wanted != got {
+                continue;
+            }
+        }
+        if let Some(client_mon) = c.get("monitor").and_then(|v| v.as_str()) {
+            if client_mon != mname {
+                continue;
+            }
+        }
+        let at = c.get("at").and_then(|v| v.as_array());
+        let size = c.get("size").and_then(|v| v.as_array());
+        let (Some(at), Some(size)) = (at, size) else { continue };
+        if at.len() < 2 || size.len() < 2 {
+            continue;
+        }
+        let x = at[0].as_i64().unwrap_or(0) as i32 - mx;
+        let y = at[1].as_i64().unwrap_or(0) as i32 - my;
+        let w = size[0].as_i64().unwrap_or(0).max(0) as u32;
+        let h = size[1].as_i64().unwrap_or(0).max(0) as u32;
+        if w == 0 || h == 0 {
+            continue;
+        }
+        out.push(Bbox { x, y, w, h });
+    }
+    Ok(out)
+}
+
 /// Given a layer's size on its major axis and the monitor's `reserved` array,
 /// pick the exclusive-zone value that best describes the bar's *reserved*
 /// thickness (ignoring any decorative overflow like rounded corners).
