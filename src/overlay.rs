@@ -204,6 +204,11 @@ struct AppState {
     /// Last snap evaluation, kept around so `draw` can render the ring +
     /// guides without re-running the snap on every frame.
     last_snap: SnapResult,
+    /// Live toggle: starts at `gesture.snap` from config, flips with `S` in
+    /// the Drawing phase. Independent from `snapper.is_some()` — when no
+    /// candidates exist the toggle has no effect, but we still track it so
+    /// the indicator reads correctly.
+    snap_enabled: bool,
 
     /// Reset on every typing event so the caret stays solid for one half-cycle
     /// after input (matches standard text-input UX).
@@ -305,6 +310,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
     // Build the snapper from pre-fetched data. If snap is disabled (radius
     // zero) or there are no candidates AND no safe-area, leave it None so
     // every snap call short-circuits to passthrough.
+    let snap_enabled = gesture.snap && gesture.snap_radius_px > 0.0;
     let snapper = if gesture.snap && gesture.snap_radius_px > 0.0 {
         // Use a generous fallback safe area when hyprctl didn't report one.
         // The configure event hasn't fired yet so we don't have width/height;
@@ -363,6 +369,7 @@ pub fn run(cfg: RunConfig) -> Result<Outcome> {
 
         snapper,
         last_snap: SnapResult::passthrough((0.0, 0.0)),
+        snap_enabled,
 
         stroke_anim_start: Instant::now(),
         caret_blink_reset: Instant::now(),
@@ -524,7 +531,8 @@ impl AppState {
     /// suppressed in the picker phase and during freehand drags — both cases
     /// where alignment to other windows isn't meaningful.
     fn apply_snap(&mut self, x: f32, y: f32) -> (f32, f32) {
-        let suppress = self.phase != Phase::Drawing
+        let suppress = !self.snap_enabled
+            || self.phase != Phase::Drawing
             || matches!(self.effective_mode(), EffectiveMode::Freehand);
         if suppress {
             self.last_snap = SnapResult::passthrough((x, y));
@@ -590,6 +598,28 @@ impl AppState {
     fn handle_key_event(&mut self, event: KeyEvent) {
         if event.keysym == Keysym::Escape {
             self.decision = Decision::Cancel;
+            return;
+        }
+
+        // `S` while drawing toggles snap for the rest of this overlay session.
+        // Only handled in Drawing — in Picking the same key is a search-query
+        // character. Ignored when the snapper is `None` (no candidates), so
+        // the toggle has nothing to flip.
+        if self.phase == Phase::Drawing
+            && matches!(event.keysym, Keysym::s | Keysym::S)
+        {
+            if self.snapper.is_some() {
+                self.snap_enabled = !self.snap_enabled;
+                // If we turned snap off mid-drag, clear any active lock so
+                // the visuals disappear immediately. Re-snap on next motion
+                // restores them when toggled back on.
+                if !self.snap_enabled {
+                    if let Some((cx, cy)) = self.cursor {
+                        self.last_snap = SnapResult::passthrough((cx, cy));
+                    }
+                }
+                self.needs_redraw = true;
+            }
             return;
         }
 
@@ -765,6 +795,13 @@ impl AppState {
                 let display = preset.split_whitespace().next().unwrap_or(&preset).to_string();
                 draw_default_banner(pixmap, &mut self.text, w_log, &display, scale, self.ctrl_held);
             }
+        }
+
+        // Snap indicator (bottom-left). Only drawn when there are candidates
+        // to snap against — otherwise the toggle is a no-op and the hint
+        // would just be noise.
+        if self.phase == Phase::Drawing && self.snapper.is_some() {
+            draw_snap_indicator(pixmap, &mut self.text, h_log, self.snap_enabled, scale);
         }
 
         if self.phase == Phase::Picking {
@@ -1108,6 +1145,69 @@ fn draw_default_banner(
         font_size * s,
         text_w_phys + 2.0 * s,
         (text_rgba.0, text_rgba.1, text_rgba.2, text_rgba.3),
+        Weight::MEDIUM,
+    );
+}
+
+/// Discreet bottom-left pill telling the user the current snap state and the
+/// toggle key. Always present (when there are candidates) so the shortcut is
+/// auto-discoverable on first run.
+fn draw_snap_indicator(
+    pixmap: &mut Pixmap,
+    text: &mut TextRenderer,
+    overlay_h: u32,
+    enabled: bool,
+    scale: u32,
+) {
+    let s = scale as f32;
+    let s_i = scale as i32;
+    let t = Transform::from_scale(s, s);
+
+    let font_size = 12.0_f32;
+    let body = if enabled {
+        "Snap: ON  ·  S to toggle".to_string()
+    } else {
+        "Snap: off  ·  S to toggle".to_string()
+    };
+    let text_w_phys = text.measure_width_weighted(&body, font_size * s, Weight::MEDIUM);
+    let text_w_log = (text_w_phys / s).ceil() as i32;
+
+    let pill_h = 24;
+    let pad_x = 12;
+    let pill_w = text_w_log + 2 * pad_x;
+    let pill_x = 16;
+    let pill_y = overlay_h as i32 - pill_h - 16;
+
+    // Color shift mirrors the default-banner: enabled glows in vaporwave
+    // magenta, disabled fades to a quiet grey so the user instantly sees
+    // which state they're in without reading the text.
+    let (bg_rgba, border_rgba, text_rgba) = if enabled {
+        ((20, 21, 30, 220), (170, 100, 255, 160), (235, 230, 245, 255))
+    } else {
+        ((20, 21, 30, 180), (110, 110, 130, 130), (180, 178, 195, 255))
+    };
+
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(bg_rgba.0, bg_rgba.1, bg_rgba.2, bg_rgba.3);
+    bg.anti_alias = true;
+    if let Some(path) = pill_path(pill_x as f32, pill_y as f32, pill_w as f32, pill_h as f32, 12.0) {
+        pixmap.fill_path(&path, &bg, FillRule::Winding, t, None);
+        let mut border = Paint::default();
+        border.set_color_rgba8(border_rgba.0, border_rgba.1, border_rgba.2, border_rgba.3);
+        border.anti_alias = true;
+        let stroke = SkStroke { width: 1.0, ..Default::default() };
+        pixmap.stroke_path(&path, &border, &stroke, t, None);
+    }
+
+    let text_y = pill_y + pill_h / 2 - (font_size * 0.44) as i32;
+    text.draw_weighted(
+        pixmap,
+        (pill_x + pad_x) * s_i,
+        text_y * s_i,
+        &body,
+        font_size * s,
+        text_w_phys + 2.0 * s,
+        text_rgba,
         Weight::MEDIUM,
     );
 }
